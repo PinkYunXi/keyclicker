@@ -1,0 +1,27 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── PyInstaller 产物 ──
+build/
+dist/
+*.manifest
+
+# ── 运行时生成 ──
+clicker_config.json
+clicker_config.json.tmp
+*.log
+
+# ── 编辑器 / 系统 ──
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
