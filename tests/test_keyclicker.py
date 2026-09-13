@@ -73,6 +73,13 @@ class _NoDialog:
         return False
 
 
+def _rgb_key(color) -> int:
+    """颜色 → 0xRRGGBB 整数，便于和 QImage 像素直接比较。"""
+    if isinstance(color, str):
+        return int(color.lstrip("#"), 16)
+    return int(color.rgb()) & 0xFFFFFF
+
+
 class _TempConfig:
     """把配置写到临时文件，避免污染真实配置文件。"""
 
@@ -1050,13 +1057,16 @@ class UiPolishTests(unittest.TestCase):
         panel = self.win.panels[0]
         old_title = kc.foreground_window_title
         old_list = kc.list_window_titles
+        old_self = kc.foreground_window_is_self
         kc.foreground_window_title = lambda: "无标题 - 记事本"
         kc.list_window_titles = lambda limit=40: ["无标题 - 记事本"]
+        kc.foreground_window_is_self = lambda: False
         try:
-            panel._grab_window()
+            panel._apply_grabbed_window()       # 倒数结束后的实际抓取动作
         finally:
             kc.foreground_window_title = old_title
             kc.list_window_titles = old_list
+            kc.foreground_window_is_self = old_self
         self.assertEqual(panel.window_edit.text(), "无标题 - 记事本")
         self.assertIn("无标题 - 记事本", [panel.window_edit.itemText(i)
                                       for i in range(panel.window_edit.count())])
@@ -1096,6 +1106,217 @@ class UiPolishTests(unittest.TestCase):
         self.assertIsInstance(self.win.windowIcon(), QIcon)
         if not kc.app_icon().isNull():       # 仓库里带了 logo 时必须真的装上
             self.assertFalse(self.win.windowIcon().isNull())
+
+
+# ══════════════════════════════════════════════════════════
+#  12. v1.2.2 界面打磨：圆角下拉 / 可见箭头 / 对勾 / 常驻热键提示
+# ══════════════════════════════════════════════════════════
+class UiPolish22Tests(unittest.TestCase):
+    """v1.2.2：下拉圆角化、自绘箭头、列表项对勾、序列区实线边框、常驻提示。"""
+
+    def setUp(self):
+        self.cfg = _TempConfig()
+        self.cfg.__enter__()
+        self.win = kc.MainWindow()
+
+    def tearDown(self):
+        self.win.close()
+        self.cfg.__exit__(None, None, None)
+
+    # ── 控件类型 ──
+    def test_all_combos_use_themed_widget(self):
+        panel = self.win.panels[0]
+        for widget in (panel.mode_combo, panel.window_mode_combo,
+                       self.win.page_combo, panel.window_edit):
+            self.assertIsInstance(widget, kc.ThemedComboBox)
+        self.assertIsInstance(panel.window_edit, kc.WindowCombo)
+
+    def test_mode_combo_has_no_fake_radio_prefix(self):
+        """「〇 连点」那种假单选圈去掉，改由列表项右侧的对勾表示当前项。"""
+        panel = self.win.panels[0]
+        texts = [panel.mode_combo.itemText(i) for i in range(panel.mode_combo.count())]
+        self.assertEqual(texts, ["连点", "定时序列"])
+        self.assertNotIn("〇", "".join(texts))
+
+    def test_combo_uses_rounded_delegate(self):
+        panel = self.win.panels[0]
+        self.assertIsInstance(panel.mode_combo.itemDelegate(),
+                              kc.RoundedItemDelegate)
+        self.assertIsInstance(panel.mode_combo.view().itemDelegate(),
+                              kc.RoundedItemDelegate)
+
+    # ── 下拉箭头可见 ──
+    def test_dropdown_arrow_is_painted(self):
+        """箭头必须是自绘的（QSS 把系统箭头压掉了），所以右侧一定有色像素。"""
+        for name in kc.THEME_NAMES:
+            kc.set_current_theme(name)
+            QApplication.instance().setStyleSheet(kc.make_qss(name))
+            combo = kc.ThemedComboBox()
+            combo.addItems(["包含", "精确", "正则"])
+            combo.resize(120, 30)
+            combo.show()
+            QApplication.processEvents()
+            pix = combo.grab()
+            img = pix.toImage()
+            theme = kc.THEMES[name]
+            want = {_rgb_key(theme["accent"]), _rgb_key(theme["fg_muted"]),
+                    _rgb_key(theme["fg_subtle"])}
+            hits = 0
+            for y in range(img.height()):
+                for x in range(max(0, img.width() - 26), img.width()):
+                    if (int(img.pixel(x, y)) & 0xFFFFFF) in want:
+                        hits += 1
+            combo.close()
+            self.assertGreater(hits, 8, f"{name} 主题下看不到下拉箭头")
+
+    def test_popup_is_frameless_top_level(self):
+        """圆角弹层：无边框 + 半透明，且绝不能被误设到主窗口上。"""
+        from PyQt6.QtCore import Qt as _Qt
+
+        panel = self.win.panels[0]
+        popup = panel.mode_combo.view().window()
+        self.assertTrue(popup.isWindow())
+        self.assertIsNot(popup, self.win.window())
+        self.assertTrue(bool(popup.windowFlags() & _Qt.WindowType.FramelessWindowHint))
+        self.assertTrue(popup.testAttribute(
+            _Qt.WidgetAttribute.WA_TranslucentBackground))
+        # 主窗口不能被牵连
+        self.assertFalse(bool(self.win.windowFlags()
+                              & _Qt.WindowType.FramelessWindowHint))
+
+    # ── 列表项：圆角高亮 + 对勾 ──
+    def test_item_delegate_paints_selection_and_checkmark(self):
+        from PyQt6.QtWidgets import QListView
+
+        for name in kc.THEME_NAMES:
+            kc.set_current_theme(name)
+            QApplication.instance().setStyleSheet(kc.make_qss(name))
+            combo = kc.ThemedComboBox()
+            combo.addItems(["包含", "精确", "正则"])
+            view = QListView()
+            view.setItemDelegate(kc.RoundedItemDelegate(combo))
+            view.setModel(combo.model())
+            view.resize(200, 99)
+            index = combo.model().index(0, 0)
+            view.setCurrentIndex(index)
+            view.selectionModel().select(
+                index, view.selectionModel().SelectionFlag.ClearAndSelect)
+            view.show()
+            QApplication.processEvents()
+            img = view.grab().toImage()
+            accent = _rgb_key(kc.THEMES[name]["accent"])
+            hits = 0
+            for y in range(img.height()):
+                for x in range(img.width()):
+                    if (int(img.pixel(x, y)) & 0xFFFFFF) == accent:
+                        hits += 1
+            view.close()
+            combo.close()
+            self.assertGreater(hits, 200, f"{name} 主题下看不出选中项")
+
+    # ── 序列区实线边框 ──
+    def test_no_dashed_border_anywhere(self):
+        for name in kc.THEME_NAMES:
+            self.assertNotIn("dashed", kc.make_qss(name))
+
+    def test_seq_area_uses_strong_solid_border(self):
+        for name in kc.THEME_NAMES:
+            qss = kc.make_qss(name)
+            strong = kc.THEMES[name]["seq_border_strong"]
+            self.assertNotEqual(strong, kc.THEMES[name]["seq_border"])
+            for selector in ("QWidget#TimerGroup", 'QPushButton#SeqBtn[filled="false"]'):
+                start = qss.index(selector)
+                rule = qss[start:qss.index("}", start)]
+                self.assertIn("solid", rule)
+                self.assertIn(strong, rule)
+
+    def test_seq_button_keeps_emphasis_background(self):
+        qss = kc.make_qss("light")
+        start = qss.index('QPushButton#SeqBtn[filled="false"]')
+        rule = qss[start:qss.index("}", start)]
+        self.assertIn(kc.THEMES["light"]["seq_bg"], rule)
+
+    # ── 复选框 / 单选框圆角指示器 ──
+    def test_checkbox_indicators_are_rounded(self):
+        for name in kc.THEME_NAMES:
+            qss = kc.make_qss(name)
+            self.assertIn("QCheckBox::indicator", qss)
+            start = qss.index("QCheckBox::indicator {")
+            rule = qss[start:qss.index("}", start)]
+            self.assertIn("border-radius: 4px", rule)
+            self.assertIn("QRadioButton::indicator", qss)
+
+    # ── 状态栏热键提示常驻 ──
+    def test_hotkey_hint_is_permanent_widget(self):
+        hint = self.win.hotkey_hint
+        self.assertIs(hint.parent(), self.win.statusBar())
+        self.assertIn("热键", hint.text())
+        before = hint.text()
+        self.win.show_status("临时消息", 3000)      # 临时消息不能顶掉常驻提示
+        QApplication.processEvents()
+        self.assertEqual(hint.text(), before)
+
+    def test_hotkey_hint_reflects_registration_result(self):
+        self.win._hotkey_names = []
+        self.win._refresh_hotkey_hint()
+        self.assertIn("失败", self.win.hotkey_hint.text())
+        self.win._hotkey_names = ["Ctrl+` 开始/停止当前页", "F6 全部停止"]
+        self.win._refresh_hotkey_hint()
+        self.assertIn("F6", self.win.hotkey_hint.text())
+        self.assertIn("Ctrl+`", self.win.hotkey_hint.text())
+
+    # ── 抓取前台窗口 ──
+    def test_grab_window_starts_countdown(self):
+        panel = self.win.panels[0]
+        panel._grab_window()
+        self.assertIsNotNone(panel._grab_timer)
+        self.assertIn("秒", panel.window_grab_btn.text())
+        self.assertFalse(panel.window_grab_btn.isEnabled())
+        panel._grab_timer.stop()
+        panel._set_grab_button(False)
+
+    def test_countdown_end_fills_keyword_and_restores_button(self):
+        panel = self.win.panels[0]
+        old = (kc.foreground_window_title, kc.list_window_titles,
+               kc.foreground_window_is_self)
+        kc.foreground_window_title = lambda: "计算器"
+        kc.list_window_titles = lambda limit=40: ["计算器", "记事本"]
+        kc.foreground_window_is_self = lambda: False
+        try:
+            panel._grab_window()
+            panel._grab_left = 0
+            panel._tick_grab_countdown()
+        finally:
+            (kc.foreground_window_title, kc.list_window_titles,
+             kc.foreground_window_is_self) = old
+        self.assertEqual(panel.window_edit.text(), "计算器")
+        self.assertEqual(panel.window_grab_btn.text(), "抓取当前窗口")
+        self.assertTrue(panel.window_grab_btn.isEnabled())
+
+    def test_grab_window_rejects_own_window(self):
+        panel = self.win.panels[0]
+        panel.window_edit.setText("")
+        old = (kc.foreground_window_title, kc.foreground_window_is_self)
+        kc.foreground_window_title = lambda: "键盘连点器"
+        kc.foreground_window_is_self = lambda: True
+        try:
+            with _NoDialog() as box:
+                panel._apply_grabbed_window()
+                self.assertTrue(box.calls)
+        finally:
+            kc.foreground_window_title, kc.foreground_window_is_self = old
+        self.assertEqual(panel.window_edit.text(), "")
+
+    def test_grab_helpers_are_safe(self):
+        self.assertIsInstance(kc.foreground_window_is_self(), bool)
+        self.assertIsInstance(kc.foreground_window_title(), str)
+        self.assertIsInstance(kc.foreground_process_name(), str)
+
+    def test_repolish_accepts_widgets(self):
+        panel = self.win.panels[0]
+        kc.repolish(panel.seq_btn)
+        kc.repolish(panel.mode_combo)
+        kc.repolish(None)          # 不允许抛异常
 
 
 if __name__ == "__main__":

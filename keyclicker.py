@@ -29,25 +29,29 @@ import time
 from dataclasses import dataclass, field
 from string import Template
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 __all__ = [
     "main", "parse_keys", "normalize_key", "is_valid_key", "validate_keys",
     "send_keys", "make_qss", "repolish", "current_theme", "set_current_theme",
     "system_theme", "resolve_config_path", "ensure_config_dir",
-    "foreground_window_title", "foreground_process_name", "match_window",
+    "foreground_window_title", "foreground_process_name",
+    "foreground_window_is_self", "match_window",
     "list_window_titles", "app_icon", "install_focus_clearer",
     "ClickTask", "TimerTask", "Page", "KeyRecorder", "KeyCaptureDialog",
-    "SequenceEditor", "TaskRow", "WindowCombo", "PagePanel", "MainWindow",
+    "SequenceEditor", "TaskRow", "RoundedItemDelegate", "ThemedComboBox",
+    "WindowCombo", "PagePanel", "MainWindow",
 ]
 
 try:
-    from PyQt6.QtCore import Qt, QEvent, QTimer, pyqtSignal, QObject
-    from PyQt6.QtGui import QIcon, QIntValidator
+    from PyQt6.QtCore import Qt, QEvent, QTimer, QSize, pyqtSignal, QObject
+    from PyQt6.QtGui import (
+        QColor, QIcon, QIntValidator, QPainter, QPainterPath, QPen,
+    )
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit,
         QComboBox, QScrollArea, QFrame, QVBoxLayout, QHBoxLayout, QDialog,
         QMessageBox, QSizePolicy, QStackedWidget, QInputDialog, QMenu,
-        QAbstractItemView, QAbstractSpinBox,
+        QAbstractItemView, QAbstractSpinBox, QStyledItemDelegate, QStyle,
     )
 
     import keyboard
@@ -94,6 +98,8 @@ THEMES = {
         # 序列 / 定时参数面板底色：浅色下用淡蓝底，与白色卡片明显区分
         "seq_bg": "#ddf4ff",
         "seq_border": "#b6e3ff",
+        # 实线强调边框：序列区 / 「点击设置序列」按钮用它，保证"看得见"
+        "seq_border_strong": "#54aeff",
         "seq_fg": "#0550ae",
         "field_bg": "#ffffff",
         "field_hover": "#eef1f4",
@@ -124,6 +130,7 @@ THEMES = {
         # 序列 / 定时参数面板底色：深色下用蓝黑底，与 #161b22 卡片明显区分
         "seq_bg": "#132339",
         "seq_border": "#1f4b7a",
+        "seq_border_strong": "#388bfd",
         "seq_fg": "#79c0ff",
         "field_bg": "#0d1117",
         "field_hover": "#30363d",
@@ -141,6 +148,9 @@ FONT_MONO = "Consolas"
 
 APP_NAME = "键盘连点器"
 CONFIG_VERSION = 2
+# 「抓取当前窗口」的倒数秒数：点击按钮时前台是本程序自己，
+# 必须等用户切到目标窗口后再读前台窗口，否则永远抓到自己。
+GRAB_COUNTDOWN_SEC = 3
 
 # 当前主题（模块级，make_qss() 不带参数时用它）
 _current_theme = DEFAULT_THEME
@@ -365,20 +375,40 @@ QComboBox:focus, QComboBox:on {
 QComboBox:disabled { color: $fg_subtle; border-color: $border_muted; }
 QComboBox::drop-down {
     subcontrol-origin: padding; subcontrol-position: center right;
-    width: 22px; border: none; background: transparent;
+    width: 26px; border: none; background: transparent;
 }
+/* 自绘箭头（ThemedComboBox.paintEvent），把 Qt 默认那个看不见的箭头压掉 */
+QComboBox::down-arrow { image: none; width: 0px; height: 0px; }
 /* 可编辑下拉里内嵌的输入框：清掉它自己的边框，避免出现“框中框” */
 QComboBox QLineEdit {
     background: transparent; border: none; padding: 0; margin: 0; outline: none;
     selection-background-color: $accent; selection-color: $on_emphasis;
 }
+/* 下拉弹层：整体圆角 + 四周留白，配合无边框半透明弹窗，不再有直角外框 */
+QComboBoxPrivateContainer { background: transparent; border: none; }
 QComboBox QAbstractItemView {
     background-color: $field_bg; color: $fg; border: 1px solid $border;
-    border-radius: 6px; padding: 4px; outline: none;
-    selection-background-color: $accent; selection-color: $on_emphasis;
+    border-radius: 8px; padding: 6px; outline: none;
+    selection-background-color: transparent; selection-color: $fg;
 }
-QComboBox QAbstractItemView::item { padding: 5px 8px; border-radius: 4px; }
-QComboBox QAbstractItemView::item:hover { background-color: $field_hover; color: $fg; }
+/* 列表项完全交给 RoundedItemDelegate 自绘（圆角高亮 + 当前项对勾），
+   这里不再设置 ::item 背景，避免又出现 Qt 默认的直角选中框 */
+QComboBox QAbstractItemView::item { border: none; }
+/* 复选框 / 单选框：圆角指示器（界面里暂未使用，作为统一样式保留） */
+QCheckBox, QRadioButton { spacing: 8px; background: transparent; }
+QCheckBox::indicator, QRadioButton::indicator {
+    width: 16px; height: 16px; border: 1px solid $border;
+    background-color: $field_bg;
+}
+QCheckBox::indicator { border-radius: 4px; }
+QRadioButton::indicator { border-radius: 8px; }
+QCheckBox::indicator:hover, QRadioButton::indicator:hover { border-color: $accent; }
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {
+    background-color: $accent; border-color: $accent;
+}
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {
+    background-color: $canvas_subtle; border-color: $border_muted;
+}
 
 /* ── 按钮 ── */
 QPushButton {
@@ -426,20 +456,22 @@ QPushButton#SeqBtn {
     text-align: left; padding: 6px 10px;
 }
 QPushButton#SeqBtn[filled="true"] {
-    background-color: $field_bg; color: $seq_fg; border: 1px solid $seq_border;
+    background-color: $field_bg; color: $seq_fg; border: 1px solid $seq_border_strong;
 }
 QPushButton#SeqBtn[filled="true"]:hover {
     background-color: $field_hover; color: $seq_fg; border-color: $seq_fg;
 }
 QPushButton#SeqBtn[filled="false"] {
-    background-color: transparent; color: $seq_fg; border: 1px dashed $seq_border;
+    background-color: $seq_bg; color: $seq_fg; border: 1px solid $seq_border_strong;
 }
 QPushButton#SeqBtn[filled="false"]:hover {
     background-color: $field_bg; color: $seq_fg; border-color: $seq_fg;
 }
-/* 定时序列参数面板：用强调色底把「倒计时 + 按键序列」整块托起来 */
+/* 定时序列参数面板：用强调色底把「倒计时 + 按键序列」整块托起来，
+   边框改成看得见的实线强调色 */
 QWidget#TimerGroup {
-    background-color: $seq_bg; border: 1px solid $seq_border; border-radius: 8px;
+    background-color: $seq_bg; border: 1px solid $seq_border_strong;
+    border-radius: 8px;
 }
 QWidget#TimerGroup QLabel { color: $seq_fg; }
 
@@ -688,6 +720,26 @@ def foreground_process_name() -> str:
             kernel32.CloseHandle(handle)
     except Exception:
         return ""
+
+
+def foreground_window_is_self() -> bool:
+    """当前前台窗口是否属于本程序（按进程号判断，比标题比较可靠）。
+
+    用于「抓取当前窗口」：如果在倒数结束后前台仍然是本程序，
+    说明用户没有切走，此时不该把本程序自己的标题填进去。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return bool(pid.value) and int(pid.value) == os.getpid()
+    except Exception:
+        return False
 
 
 # 枚举窗口时忽略的系统噪声标题（小写比较）
@@ -1515,9 +1567,150 @@ class SequenceEditor(QDialog):
 
 
 # ══════════════════════════════════════════════════════════
+#  统一下拉控件：圆角弹层 + 圆角列表项 + 自绘箭头
+# ══════════════════════════════════════════════════════════
+class RoundedItemDelegate(QStyledItemDelegate):
+    """下拉列表项自绘：圆角高亮 + 当前项圆润对勾。
+
+    默认的 QStyledItemDelegate 会跟着系统 / Fusion 风格画出直角选中框，
+    深浅色下都不好看（深色下甚至看不出选中）。这里完全自绘：
+      · 悬停 → 圆角浅底
+      · 选中（键盘移动 / 鼠标按下） → 圆角强调色底 + 反白文字
+      · 当前项 → 右侧一个圆角对勾
+    """
+
+    def __init__(self, combo: "QComboBox"):
+        super().__init__(combo)
+        self._combo = combo
+
+    def sizeHint(self, option, index):      # noqa: N802 - Qt 命名
+        base = super().sizeHint(option, index)
+        return QSize(base.width() + 36, max(28, option.fontMetrics.height() + 12))
+
+    def paint(self, painter, option, index):    # noqa: N802 - Qt 命名
+        tokens = THEMES[current_theme()]
+        text = str(index.data() or "")
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
+        try:
+            is_current = index.row() == self._combo.currentIndex()
+        except Exception:
+            is_current = False
+
+        if selected:
+            bg, fg = QColor(tokens["accent"]), QColor(tokens["on_emphasis"])
+        elif hovered:
+            bg, fg = QColor(tokens["field_hover"]), QColor(tokens["fg"])
+        else:
+            bg, fg = None, QColor(tokens["fg"] if enabled else tokens["fg_subtle"])
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = option.rect.adjusted(2, 1, -2, -1)
+        if bg is not None:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(bg)
+            painter.drawRoundedRect(rect, 7, 7)
+
+        text_rect = rect.adjusted(12, 0, -30, 0)
+        painter.setPen(fg)
+        painter.drawText(
+            text_rect,
+            int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+            option.fontMetrics.elidedText(
+                text, Qt.TextElideMode.ElideRight, max(0, text_rect.width())))
+
+        if is_current:
+            pen = QPen(fg)
+            pen.setWidthF(2.0)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            cx = rect.right() - 14
+            cy = rect.center().y()
+            check = QPainterPath()
+            check.moveTo(cx - 4.6, cy + 0.2)
+            check.lineTo(cx - 1.4, cy + 3.4)
+            check.lineTo(cx + 4.8, cy - 3.6)
+            painter.drawPath(check)
+        painter.restore()
+
+
+class ThemedComboBox(QComboBox):
+    """统一下拉框：自带圆角箭头 + 圆角半透明弹层 + 圆角列表项。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setItemDelegate(RoundedItemDelegate(self))
+        view = self.view()
+        if view is not None:
+            view.setMouseTracking(True)         # 让列表项能收到 hover
+            view.setFrameShape(QFrame.Shape.NoFrame)
+            self._round_popup(view)
+
+    def _round_popup(self, view) -> None:
+        """把下拉弹层改成无边框 + 半透明，圆角才不会被直角窗口切掉。
+
+        弹层本身就是独立的顶层窗口，与主窗口无关，所以改它的窗口标志
+        不会影响主界面；这里还额外做了两层防御，确保不会误伤自己的窗口。
+        """
+        try:
+            popup = view.window()
+        except Exception:
+            return
+        if popup is None or not popup.isWindow() or popup is self.window():
+            return
+        try:
+            popup.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+            popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        except Exception:
+            pass
+
+    def _arrow_color(self) -> QColor:
+        tokens = THEMES[current_theme()]
+        if not self.isEnabled():
+            return QColor(tokens["fg_subtle"])
+        try:
+            opened = self.view().isVisible()
+        except Exception:
+            opened = False
+        if opened or self.underMouse() or self.hasFocus():
+            return QColor(tokens["accent"])
+        return QColor(tokens["fg_muted"])
+
+    def paintEvent(self, event):            # noqa: N802 - Qt 命名
+        super().paintEvent(event)
+        if self.width() < 34:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(self._arrow_color())
+        pen.setWidthF(1.7)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        cx = self.width() - 17
+        cy = self.height() / 2.0 + 0.5
+        arrow = QPainterPath()
+        arrow.moveTo(cx - 4.6, cy - 2.4)
+        arrow.lineTo(cx, cy + 2.4)
+        arrow.lineTo(cx + 4.6, cy - 2.4)
+        painter.drawPath(arrow)
+        painter.end()
+
+    def wheelEvent(self, event):            # noqa: N802 - Qt 命名
+        # 放在滚动区域内时，滚轮不应该顺手改掉选项
+        event.ignore()
+
+
+# ══════════════════════════════════════════════════════════
 #  配置页面板
 # ══════════════════════════════════════════════════════════
-class WindowCombo(QComboBox):
+class WindowCombo(ThemedComboBox):
     """可编辑下拉框：点开时实时列出当前所有可见窗口标题，也能直接手输。
 
     特意保留了 QLineEdit 的常用接口（text / setText / textChanged），
@@ -1570,10 +1763,6 @@ class WindowCombo(QComboBox):
         self.refresh_windows()
         super().showPopup()
 
-    def wheelEvent(self, event):
-        # 放在滚动区域内时，滚轮不应该顺手改掉窗口关键词
-        event.ignore()
-
 
 class PagePanel(QWidget):
     dataChanged = pyqtSignal()
@@ -1584,6 +1773,8 @@ class PagePanel(QWidget):
         self.rows: list[TaskRow] = []
         self._timer_seq: list = []
         self._stat_text = ""
+        self._grab_timer = None
+        self._grab_left = 0
         self._build()
         self._rebuild_rows()
         self._refresh_stats()
@@ -1601,8 +1792,8 @@ class PagePanel(QWidget):
 
         mode_row = QHBoxLayout()
         mode_row.addWidget(_label("任务类型"))
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["〇  连点", "〇  定时序列"])
+        self.mode_combo = ThemedComboBox()
+        self.mode_combo.addItems(["连点", "定时序列"])
         self.mode_combo.setFixedWidth(150)
         self.mode_combo.setToolTip(
             "任务类型：\n"
@@ -1688,7 +1879,7 @@ class PagePanel(QWidget):
             "点开下拉框会实时列出当前所有可见窗口的标题，选中即可；\n"
             "也可以直接输入关键词，配合右侧「包含 / 精确 / 正则」使用")
         r3.addWidget(self.window_edit, 1)
-        self.window_mode_combo = QComboBox()
+        self.window_mode_combo = ThemedComboBox()
         for m in WINDOW_MODES:
             self.window_mode_combo.addItem(WINDOW_MODE_LABELS[m], m)
         self.window_mode_combo.setFixedWidth(92)
@@ -1746,24 +1937,81 @@ class PagePanel(QWidget):
         self.click_grp.setVisible(i == 0)
         self.timer_grp.setVisible(i == 1)
 
+    # ── 抓取前台窗口 ──
     def _grab_window(self):
-        """把当前前台窗口标题写入输入框，并在状态栏提示窗口所属程序。"""
+        """开始倒数抓取：点击按钮的瞬间前台是本程序自己，直接读只会抓到自己。
+
+        所以先倒数 GRAB_COUNTDOWN_SEC 秒（按钮上实时显示剩余秒数），
+        让用户切到目标窗口，倒数结束后再读前台窗口标题。
+        """
+        if self._grab_timer is not None and self._grab_timer.isActive():
+            return
+        self._grab_left = GRAB_COUNTDOWN_SEC
+        self._set_grab_button(True)
+        self._grab_status(
+            f"请在 {GRAB_COUNTDOWN_SEC} 秒内切换到目标窗口，倒数结束后自动抓取…", 0)
+        self._tick_grab_countdown()
+
+    def _set_grab_button(self, busy: bool) -> None:
+        """抓取期间按钮显示剩余秒数并临时禁用，避免重复触发。"""
+        try:
+            self.window_grab_btn.setEnabled(not busy)
+            if not busy:
+                self.window_grab_btn.setText("抓取当前窗口")
+        except Exception:
+            pass
+
+    def _tick_grab_countdown(self):
+        if self._grab_left > 0:
+            try:
+                self.window_grab_btn.setText(f"{self._grab_left} 秒…")
+            except Exception:
+                pass
+            self._grab_left -= 1
+            if self._grab_timer is None:
+                self._grab_timer = QTimer(self)
+                self._grab_timer.setSingleShot(False)
+                self._grab_timer.timeout.connect(self._tick_grab_countdown)
+            self._grab_timer.start(1000)
+            return
+        if self._grab_timer is not None:
+            self._grab_timer.stop()
+        self._set_grab_button(False)
+        self._apply_grabbed_window()
+
+    def _apply_grabbed_window(self):
+        """读取当前前台窗口并写入输入框（倒数结束后调用，也可直接调用）。"""
         title = foreground_window_title()
         if not title:
             QMessageBox.information(self, "提示", "未能读取当前前台窗口标题。")
+            self._grab_status("未能读取当前前台窗口标题", 3000)
+            return
+        if foreground_window_is_self():
+            QMessageBox.information(
+                self, "提示",
+                "抓到的仍然是本程序自己的窗口。\n"
+                "请先切换到目标窗口，再点「抓取当前窗口」。\n"
+                "（也可以直接点开下拉框，从窗口列表里选）")
+            self._grab_status("未检测到其它前台窗口，请先切到目标窗口", 4000)
             return
         self.window_edit.refresh_windows()   # 顺手把最新窗口列表刷进下拉
         self.window_edit.setText(title)
         if not title in [self.window_edit.itemText(i)
                          for i in range(self.window_edit.count())]:
-            # 下拉里没有（例如抓的是本程序自己的窗口）就补一条，避免看起来"没抓到"
+            # 下拉里没有就补一条，避免看起来"没抓到"
             self.window_edit.insertItem(0, title)
         proc = foreground_process_name()
         msg = f"已抓取窗口标题：{title}" + (f"（{proc}）" if proc else "")
+        self._grab_status(msg, 4000)
+
+    def _grab_status(self, msg: str, timeout: int = 4000):
+        """状态栏提示：状态栏是被动读取的，这里只做尽力而为的提示。"""
         parent = self.window()
         try:
-            if hasattr(parent, "statusBar"):
-                parent.statusBar().showMessage(msg, 4000)
+            if hasattr(parent, "show_status"):
+                parent.show_status(msg, timeout)
+            elif hasattr(parent, "statusBar"):
+                parent.statusBar().showMessage(msg, timeout)
         except Exception:
             pass
 
@@ -1951,6 +2199,7 @@ class MainWindow(QMainWindow):
         self._bridge = _MainBridge()
         self._bridge.toggleAll.connect(self._hotkey_toggle)
         self._bridge.panicAll.connect(self._hotkey_panic)
+        self._hotkey_names: list[str] = []
         self._setup_hotkey()
         self._center()
 
@@ -1992,7 +2241,7 @@ class MainWindow(QMainWindow):
         bl.setSpacing(8)
         bl.addWidget(_label("当前页", "muted"))
 
-        self.page_combo = QComboBox()
+        self.page_combo = ThemedComboBox()
         self.page_combo.setFixedWidth(140)
         self.page_combo.setToolTip("切换配置页：每一页都有自己独立的任务列表")
         self.page_combo.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -2027,9 +2276,35 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         root.addWidget(self.stack, 1)
 
-        self.statusBar().setSizeGripEnabled(False)
-        self.statusBar().showMessage(
-            "就绪   ·   热键 Ctrl+` 开始/停止当前页，F6 全部停止   ·   配置自动保存")
+        # 状态栏：左侧是临时消息（会被新消息顶掉），
+        # 右侧的快捷键提示是常驻控件 —— 打开对话框、切页、抓取窗口都不会让它消失。
+        bar = self.statusBar()
+        bar.setSizeGripEnabled(False)
+        self.hotkey_hint = _label("", "hint")
+        self.hotkey_hint.setObjectName("HotkeyHint")
+        self.hotkey_hint.setToolTip("全局热键在任何窗口下都生效")
+        bar.addPermanentWidget(self.hotkey_hint)
+        self.show_status("就绪   ·   配置自动保存", 3000)
+
+    def _refresh_hotkey_hint(self):
+        """刷新状态栏里常驻的快捷键提示（热键注册结果变化时调用）。"""
+        if self._hotkey_names:
+            names = "   ·   ".join(self._hotkey_names)
+            text = f"热键：{names}"
+        else:
+            text = "热键：注册失败（可尝试以管理员身份运行）"
+        try:
+            if self.hotkey_hint.text() != text:
+                self.hotkey_hint.setText(text)
+        except Exception:
+            pass
+
+    def show_status(self, msg: str, timeout: int = 3000):
+        """显示一条临时状态消息；常驻的快捷键提示不受影响。"""
+        try:
+            self.statusBar().showMessage(msg, timeout)
+        except Exception:
+            pass
 
     def _build_options_menu(self):
         menu = QMenu(self)
@@ -2181,12 +2456,13 @@ class MainWindow(QMainWindow):
                 hotkeys.append(combo)
             except Exception:
                 continue
+        self._hotkey_names = ["Ctrl+` 开始/停止当前页" if c == "ctrl+`" else "F6 全部停止"
+                              for c in hotkeys]
+        self._refresh_hotkey_hint()
         if hotkeys:
-            names = " / ".join("Ctrl+`" if c == "ctrl+`" else c.upper() for c in hotkeys)
-            self.statusBar().showMessage(f"就绪   ·   热键 {names}   ·   配置自动保存")
+            self.show_status("就绪   ·   配置自动保存", 3000)
         else:
-            self.statusBar().showMessage(
-                "就绪   ·   全局热键注册失败（可尝试以管理员身份运行）   ·   配置自动保存")
+            self.show_status("就绪   ·   全局热键注册失败（可尝试以管理员身份运行）", 5000)
 
     def _hotkey_panic(self):
         """F6：停掉所有页面的全部任务（紧急停止）。"""
@@ -2199,7 +2475,7 @@ class MainWindow(QMainWindow):
         if panel is not None:
             panel._refresh_rows()
             panel._refresh_stats()
-        self.statusBar().showMessage("已全部停止（F6）", 3000)
+        self.show_status("已全部停止（F6）", 3000)
 
     def _poll(self):
         # 只刷新当前可见面板，避免后台页白白重绘；
