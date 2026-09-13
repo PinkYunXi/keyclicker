@@ -5,11 +5,10 @@
   · 定时序列：倒计时结束后依次发送一串按键，可循环触发
   · 多配置页：多套互不干扰的任务，配置自动保存（原子写入）
   · 按键录入：连点按键与定时序列都能"按下即录入"，无需手写键名
-  · 窗口锁定：三种生效方式 —— 前台标题匹配 / 同进程 / 绑定窗口后台投递
-  · 后台投递：绑定窗口后即使焦点不在它上面，也能把按键直接投递给它（多开用）
-  · 便携配置：默认把配置写在 exe 同目录，整个文件夹拷走即可，换电脑不丢
+  · 窗口锁定：仅当前台窗口标题匹配时才发送按键
   · 双主题：GitHub Primer 风格浅色 / 深色，一键切换并记忆
   · 全局热键：Ctrl+` 开始/停止当前页，F6 全部停止（紧急停止）
+  · 便携配置：默认把配置写在 exe 同目录，整个文件夹拷走即可，换电脑不丢
 
 运行：
     python keyclicker.py
@@ -35,15 +34,13 @@ from string import Template
 __version__ = "1.2.4"
 __all__ = [
     "main", "parse_keys", "normalize_key", "is_valid_key", "validate_keys",
-    "send_keys", "make_qss", "repolish", "current_theme", "set_current_theme",
+    "send_keys", "hold_ms_for", "make_qss", "repolish",
+    "current_theme", "set_current_theme",
     "system_theme", "resolve_config_path", "ensure_config_dir",
     "migrate_legacy_config",
     "foreground_window_title", "foreground_process_name",
-    "foreground_window_is_self", "match_window", "foreground_window_pid",
-    "list_window_titles", "list_windows", "find_window", "window_pid",
-    "window_process_name", "is_window_valid", "key_vk_scan", "post_keys",
-    "SEND_MODES", "SEND_MODE_LABELS",
-    "app_icon", "install_focus_clearer",
+    "foreground_window_is_self", "match_window",
+    "list_window_titles", "app_icon", "install_focus_clearer",
     "ClickTask", "TimerTask", "Page", "KeyRecorder", "KeyCaptureDialog",
     "SequenceEditor", "TaskRow", "RoundedItemDelegate", "ThemedComboBox",
     "WindowCombo", "PagePanel", "MainWindow",
@@ -468,9 +465,8 @@ QPushButton#Icon, QPushButton#IconDanger {
 QPushButton#Icon:hover { background-color: $btn_hover; color: $accent; }
 QPushButton#IconDanger:hover { background-color: $btn_hover; color: $danger; }
 QPushButton#SeqBtn {
-    /* 注意：600/700 在「微软雅黑 UI」上会落到真正的 Bold（该字体只有
-       Regular/Light/Bold 三档），13px 中文一加粗笔画就发糊。
-       这里用 500（实际回落到 Regular）配不透明底色，字最清晰。 */
+    /* 字重必须是 500：「微软雅黑 UI」只有 Regular / Light / Bold 三档，
+       600 / 700 会落到真正的 Bold，13px 的中文一加粗笔画就发糊。 */
     font-family: "$font_main"; font-size: 13px; font-weight: 500;
     text-align: left; padding: 6px 10px;
 }
@@ -481,8 +477,7 @@ QPushButton#SeqBtn[filled="true"]:hover {
     background-color: $field_hover; color: $seq_fg; border-color: $seq_fg;
 }
 QPushButton#SeqBtn[filled="false"] {
-    /* 未设置序列：仍是序列区的强调底色，但文字用最实的前景色
-       （深蓝压浅蓝底在 13px 下也会显得发虚） */
+    /* 未设置序列时用最实的前景色：深蓝压在浅蓝底上，13px 下同样会发虚 */
     background-color: $seq_bg; color: $fg; border: 1px solid $seq_border_strong;
 }
 QPushButton#SeqBtn[filled="false"]:hover {
@@ -534,7 +529,6 @@ def make_qss(theme_name: str | None = None) -> str:
 
 
 # ── 配置位置 ──
-# 便携优先：默认把配置写在 exe（或脚本）同目录，整个文件夹拷到别的电脑也不会丢。
 CONFIG_FILENAME = "clicker_config.json"
 
 
@@ -546,21 +540,24 @@ def _app_dir() -> str:
 
 
 def _portable_config_path(app_dir: str | None = None) -> str:
-    """便携配置路径：程序目录下的 clicker_config.json。"""
+    """便携配置路径：程序（exe）同目录下的 clicker_config.json。"""
     return os.path.join(app_dir or _app_dir(), CONFIG_FILENAME)
 
 
 def _user_config_path() -> str:
-    """备用配置路径：%APPDATA%\\KeyClicker\\config.json（程序目录不可写时用）。"""
+    """兜底配置路径：%APPDATA%\\KeyClicker\\config.json"""
     base = os.environ.get("APPDATA") or os.path.expanduser("~")
     return os.path.join(base, "KeyClicker", "config.json")
 
 
 def _dir_writable(directory: str) -> bool:
-    """目录是否存在且可写（真的建一个临时文件试一下，比 os.access 可靠）。"""
+    """目录是否真的可写：建一个临时文件试一下再删掉。
+
+    比 os.access() 可靠 —— 后者在 Windows 上只看只读属性，
+    遇到 Program Files 这种需要 UAC 提升的目录会给出乐观答案。
+    """
+    probe = os.path.join(directory, ".kc_write_probe")
     try:
-        os.makedirs(directory, exist_ok=True)
-        probe = os.path.join(directory, f".keyclicker_write_{os.getpid()}.tmp")
         with open(probe, "w", encoding="utf-8") as f:
             f.write("")
         os.remove(probe)
@@ -572,13 +569,16 @@ def _dir_writable(directory: str) -> bool:
 def resolve_config_path(app_dir: str | None = None) -> str:
     """解析配置文件路径，优先级由高到低：
 
-    1. 环境变量 ``KEYCLICKER_CONFIG``（非空，方便多份配置/测试）
+    1. 环境变量 ``KEYCLICKER_CONFIG``（非空）
     2. 程序目录下**已存在**的 ``clicker_config.json``（已经在用便携配置）
-    3. 程序目录**可写** → 程序目录下 ``clicker_config.json``（v1.2.4 起的默认：
-       便携优先，换电脑连同 exe 一起拷走就不会丢配置）
-    4. 否则 ``%APPDATA%\\KeyClicker\\config.json``（放在只读目录时的兜底）
+    3. 程序目录**可写** → 程序目录下 ``clicker_config.json``（默认，便携优先）
+    4. 否则 ``%APPDATA%\\KeyClicker\\config.json``（只读安装目录兜底）
 
-    这里只解析路径、不创建任何目录/文件（保持无副作用，方便测试与查询）。
+    第 3 条是 v1.2.4 的行为改变：以前要手动放 ``portable.flag`` 才便携，
+    结果"换个电脑配置就丢"，现在默认就写在程序旁边，整个文件夹拷走即可。
+
+    这里只解析路径、不创建任何目录/文件（保持无副作用，方便测试与查询）；
+    目录在真正写入配置时由 :func:`ensure_config_dir` 创建。
     """
     env = (os.environ.get("KEYCLICKER_CONFIG") or "").strip()
     if env:
@@ -593,41 +593,35 @@ def resolve_config_path(app_dir: str | None = None) -> str:
 
 
 def legacy_config_paths(app_dir: str | None = None) -> list[str]:
-    """可能残留旧配置的位置（用于自动迁移）。
-
-    v1.2.3 及更早版本默认把配置写在 ``%APPDATA%\\KeyClicker\\config.json``，
-    升级后如果便携位置还没有配置，就把旧配置搬过来，避免"任务全没了"。
-    """
+    """旧版本可能用过的配置路径（用于升级时自动迁移）。"""
     base = app_dir or _app_dir()
-    paths = [_user_config_path(), os.path.join(base, "clicker_config.json")]
-    out: list[str] = []
-    for p in paths:
-        if p not in out:
-            out.append(p)
-    return out
+    return [
+        _user_config_path(),
+        os.path.join(base, "config.json"),
+    ]
 
 
 def migrate_legacy_config(dest: str | None = None,
                           app_dir: str | None = None) -> str | None:
-    """把旧位置的配置迁移到 ``dest``（仅在 dest 不存在、旧文件存在时）。
+    """把旧位置的配置搬到当前配置位置，返回被迁移的源路径。
 
-    返回被迁移过来的旧文件路径；没有可迁移的内容时返回 None。
-    只做一次复制，不删除旧文件（保留回退余地）。
+    只在目标不存在时迁移（绝不覆盖现有配置），而且**只复制不删除** ——
+    旧文件留在原地，万一新版有问题还能拿回来。
     """
     target = dest or CONFIG_PATH
-    try:
-        if os.path.exists(target):
-            return None
-        for old in legacy_config_paths(app_dir):
-            if os.path.abspath(old) == os.path.abspath(target):
-                continue
-            if not os.path.isfile(old):
-                continue
-            ensure_config_dir(target)
-            shutil.copyfile(old, target)
-            return old
-    except Exception:
+    if os.path.exists(target):
         return None
+    for src in legacy_config_paths(app_dir):
+        if os.path.abspath(src) == os.path.abspath(target):
+            continue
+        if not os.path.exists(src):
+            continue
+        try:
+            ensure_config_dir(target)
+            shutil.copy2(src, target)
+            return src
+        except Exception:
+            continue
     return None
 
 
@@ -742,368 +736,28 @@ def send_keys(keys: list[str], hold_ms: int = 20) -> bool:
     return True
 
 
+def hold_ms_for(interval_ms: int, default: int = 20) -> int:
+    """按节拍算出「按住」时长（毫秒）。
+
+    节拍 >= 40ms 时返回 default（20ms），手感与旧版完全一致；节拍更快时
+    按一半节拍缩短，否则每次固定按住 20ms 会把实际速率卡在 ~48 次/秒——
+    用户把间隔设成 16ms（界面允许的最小值）也跑不出来。下限 10ms：即使
+    按最小节拍（16ms）也塞得下，速率不受影响，而 10ms 的按住时长对
+    100Hz 轮询的程序也够用（send_keys 自己还有 8ms 的绝对下限）。
+    """
+    try:
+        interval = int(interval_ms)
+    except (TypeError, ValueError):
+        return default
+    return max(10, min(int(default), interval // 2))
+
+
 # ══════════════════════════════════════════════════════════
-#  前台窗口标题匹配 / 目标窗口绑定
+#  前台窗口标题匹配
 # ══════════════════════════════════════════════════════════
-# 窗口标题匹配模式：包含 / 精确 / 正则
+# 窗口匹配模式：包含 / 精确 / 正则
 WINDOW_MODES = ("contains", "exact", "regex")
 WINDOW_MODE_LABELS = {"contains": "包含", "exact": "精确", "regex": "正则"}
-
-# 按键生效方式（v1.2.4）：
-#   foreground —— 前台窗口标题匹配才发送（老行为，最稳）
-#   process    —— 前台窗口属于绑定的那个进程就发送（同一程序多开时好用）
-#   window     —— 不管前台是谁，直接把按键投递给绑定的那个窗口
-#                 （全程不抢焦点、不切前台，可后台多开）
-SEND_MODES = ("foreground", "process", "window")
-SEND_MODE_LABELS = {
-    "foreground": "前台匹配",
-    "process": "同进程",
-    "window": "绑定窗口",
-}
-SEND_MODE_TIPS = {
-    "foreground": "仅当前台窗口标题命中时才发送按键（最稳妥，任何程序都支持）",
-    "process": "当前台窗口属于绑定的那个进程时就发送（同一程序多开、来回切换时好用）",
-    "window": "绑定窗口后不再看前台是谁，直接把按键投递给该窗口：\n"
-              "不抢焦点、不切前台，可以一边挂机一边用电脑。\n"
-              "注意：只有用标准消息收按键的程序才吃这套；用 DirectInput/原始输入的\n"
-              "游戏收不到投递，那种情况只能用「同进程」方式（需要目标在前台）。",
-}
-
-
-def foreground_window_pid() -> int:
-    """当前前台窗口所属进程号；失败返回 0。"""
-    try:
-        import ctypes
-        from ctypes import wintypes
-        user32 = ctypes.windll.user32
-        hwnd = user32.GetForegroundWindow()
-        if not hwnd:
-            return 0
-        pid = wintypes.DWORD(0)
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        return int(pid.value)
-    except Exception:
-        return 0
-
-
-def window_pid(hwnd: int) -> int:
-    """指定窗口所属进程号；失败返回 0。"""
-    if not hwnd:
-        return 0
-    try:
-        import ctypes
-        from ctypes import wintypes
-        pid = wintypes.DWORD(0)
-        ctypes.windll.user32.GetWindowThreadProcessId(
-            wintypes.HWND(int(hwnd)), ctypes.byref(pid))
-        return int(pid.value)
-    except Exception:
-        return 0
-
-
-def window_process_name(hwnd: int) -> str:
-    """指定窗口所属进程的可执行文件名；失败返回空串。"""
-    pid = window_pid(hwnd)
-    if not pid:
-        return ""
-    try:
-        import ctypes
-        from ctypes import wintypes
-        kernel32 = ctypes.windll.kernel32
-        process_query_limited_information = 0x1000
-        handle = kernel32.OpenProcess(
-            process_query_limited_information, False, pid)
-        if not handle:
-            return ""
-        try:
-            size = wintypes.DWORD(1024)
-            buf = ctypes.create_unicode_buffer(size.value)
-            if not kernel32.QueryFullProcessImageNameW(
-                    handle, 0, buf, ctypes.byref(size)):
-                return ""
-            return os.path.basename(buf.value or "")
-        finally:
-            kernel32.CloseHandle(handle)
-    except Exception:
-        return ""
-
-
-def is_window_valid(hwnd: int) -> bool:
-    """窗口句柄是否仍然有效（目标程序关掉了就返回 False）。"""
-    if not hwnd:
-        return False
-    try:
-        import ctypes
-        from ctypes import wintypes
-        return bool(ctypes.windll.user32.IsWindow(wintypes.HWND(int(hwnd))))
-    except Exception:
-        return False
-
-
-def _window_title(hwnd: int) -> str:
-    """指定窗口的标题；失败返回空串。"""
-    try:
-        import ctypes
-        user32 = ctypes.windll.user32
-        length = int(user32.GetWindowTextLengthW(hwnd))
-        if length <= 0:
-            return ""
-        buf = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buf, length + 1)
-        return buf.value or ""
-    except Exception:
-        return ""
-
-
-def _enum_windows(skip_self: bool = True) -> list[dict]:
-    """枚举当前所有可见且有标题的顶层窗口。
-
-    返回 ``[{"hwnd":…, "title":…, "pid":…, "exe":…}, …]``，按 z 序（最前面在前）。
-    供下拉列表、目标窗口查找共用；任何异常都返回空列表，绝不抛错。
-    这是本模块唯一的重活（EnumWindows + 每窗口若干 Win32 调用），
-    调用方请自行缓存，不要在按毫秒计时的任务循环里直接调。
-    """
-    items: list[dict] = []
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        user32 = ctypes.windll.user32
-        own_pid = os.getpid()
-        try:
-            dwmapi = ctypes.windll.dwmapi
-        except Exception:
-            dwmapi = None
-        enum_proc = ctypes.WINFUNCTYPE(
-            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-        def _visit(hwnd, _lparam):
-            try:
-                if not user32.IsWindowVisible(hwnd):
-                    return True
-                if dwmapi is not None:
-                    cloaked = wintypes.DWORD(0)
-                    dwmapi.DwmGetWindowAttribute(
-                        hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
-                    if cloaked.value:
-                        return True
-                length = int(user32.GetWindowTextLengthW(hwnd))
-                if length <= 0:
-                    return True
-                buf = ctypes.create_unicode_buffer(length + 1)
-                user32.GetWindowTextW(hwnd, buf, length + 1)
-                title = (buf.value or "").strip()
-                if not title or title.lower() in _WINDOW_TITLE_SKIP:
-                    return True
-                pid = wintypes.DWORD(0)
-                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                if skip_self and pid.value == own_pid:
-                    return True
-                handle = int(hwnd)
-                items.append({"hwnd": handle, "title": title,
-                              "pid": int(pid.value),
-                              "exe": window_process_name(handle)})
-            except Exception:
-                pass
-            return True
-
-        user32.EnumWindows(enum_proc(_visit), 0)
-    except Exception:
-        return []
-    return items
-
-
-def list_windows(limit: int = 60, skip_self: bool = True) -> list[dict]:
-    """枚举窗口列表（去重：同标题只留最前面那个），供界面/匹配使用。"""
-    seen = set()
-    out: list[dict] = []
-    for w in _enum_windows(skip_self=skip_self):
-        key = (w.get("title", "").lower(), w.get("pid", 0))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(w)
-        if len(out) >= max(1, int(limit)):
-            break
-    return out
-
-
-def find_window(pattern: str = "", mode: str = "contains",
-                pid: int = 0, exe: str = "",
-                windows: list[dict] | None = None) -> int:
-    """按「进程 + 标题」找目标窗口，返回窗口句柄（找不到返回 0）。
-
-    优先级：同进程且标题匹配 → 同可执行文件且标题匹配 → 仅标题匹配。
-    ``pid`` / ``exe`` 都是 0/空时退化为纯标题匹配；``pattern`` 也为空时
-    返回最前面的窗口（用于"绑定当前前台窗口"这类场景）。
-    """
-    wins = windows if windows is not None else _enum_windows()
-    if not wins:
-        return 0
-    exe_l = (exe or "").strip().lower()
-
-    def _title_ok(w) -> bool:
-        return match_window(pattern, w.get("title", ""), mode)
-
-    for want_same in (True, False):
-        for w in wins:
-            if pid and w.get("pid") != pid:
-                continue
-            if not pid and exe_l and (w.get("exe", "") or "").lower() != exe_l:
-                continue
-            if _title_ok(w):
-                return int(w.get("hwnd", 0))
-        if not (pid or exe_l):
-            break
-    if pid or exe_l:
-        # 绑定的进程已经不在（重启过）→ 退化为纯标题匹配，尽量别让用户重抓
-        for w in wins:
-            if _title_ok(w):
-                return int(w.get("hwnd", 0))
-    return 0
-
-
-def match_window(pattern: str, title: str, mode: str = "contains") -> bool:
-    """纯函数：判断窗口标题是否命中匹配条件。
-
-    · ``pattern`` 为空 → 恒为 True（即不限制窗口）
-    · ``contains`` / ``exact`` 大小写不敏感
-    · ``regex`` 使用 ``re.search``；非法正则返回 False 且不抛异常
-    · 未知 mode 按 ``contains`` 处理
-    """
-    pat = (pattern or "").strip()
-    if not pat:
-        return True
-    text = title or ""
-    how = (mode or "contains").strip().lower()
-    try:
-        if how == "exact":
-            return text.strip().lower() == pat.lower()
-        if how == "regex":
-            return re.search(pat, text, re.IGNORECASE) is not None
-        return pat.lower() in text.lower()
-    except re.error:
-        return False          # 正则写错 → 视为不匹配，绝不抛出
-    except Exception:
-        return False
-
-
-# ══════════════════════════════════════════════════════════
-#  按键投递（把按键直接发给指定窗口，不需要它有焦点）
-# ══════════════════════════════════════════════════════════
-WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
-WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0104, 0x0105
-
-# 需要带「扩展键」标记的按键（方向键/编辑键区/右 Ctrl 等），
-# 少了这个标记，很多程序会把方向键认成小键盘数字。
-_EXTENDED_KEY_NAMES = {
-    "up", "down", "left", "right", "insert", "delete", "home", "end",
-    "page up", "page down", "num lock", "print screen", "right ctrl",
-    "right alt", "num enter", "divide", "/", "num /", "right shift",
-}
-
-
-def key_vk_scan(name: str) -> tuple[int, int, bool] | None:
-    """键名 → ``(虚拟键码, 扫描码, 是否扩展键)``；无法识别返回 None。
-
-    只做查表/换算，不发任何按键 —— 后台投递（post_keys）需要这三个值。
-    """
-    key = normalize_key(name)
-    if not key:
-        return None
-    try:
-        codes = list(keyboard.key_to_scan_codes(key))
-    except Exception:
-        return None
-    if not codes:
-        return None
-    try:
-        import ctypes
-        user32 = ctypes.windll.user32
-    except Exception:
-        return None
-
-    def _vk_of_scan(scan: int) -> int:
-        try:
-            return int(user32.MapVirtualKeyW(int(scan), 3))   # VSC → VK_EX
-        except Exception:
-            return 0
-
-    def _scan_of_vk(vk: int) -> int:
-        try:
-            return int(user32.MapVirtualKeyW(int(vk), 0))     # VK → VSC
-        except Exception:
-            return 0
-
-    fallback: tuple[int, int, bool] | None = None
-    for raw in codes:
-        raw = int(raw)
-        if raw <= 0xFF:                     # 普通扫描码
-            scan, vk = raw, _vk_of_scan(raw)
-        elif raw & 0xE000:                  # 0xE0xx：扩展键扫描码
-            scan, vk = raw & 0xFF, _vk_of_scan(raw & 0xFF)
-        else:                               # 大于 0xFF 又没扩展标记 → 其实是虚拟键码
-            vk, scan = raw, _scan_of_vk(raw)
-        if not vk and not scan:
-            continue
-        ext = bool(raw & 0xE000) or key in _EXTENDED_KEY_NAMES
-        if vk:
-            return vk, scan, ext
-        if fallback is None:
-            fallback = vk, scan, ext
-    return fallback
-
-
-def _post_message(hwnd: int, msg: int, vk: int, lparam: int) -> bool:
-    """PostMessageW 的一层薄封装（单元测试会替换它，避免真的发消息）。"""
-    try:
-        import ctypes
-        from ctypes import wintypes
-        return bool(ctypes.windll.user32.PostMessageW(
-            wintypes.HWND(int(hwnd)), int(msg),
-            wintypes.WPARAM(int(vk)), wintypes.LPARAM(int(lparam))))
-    except Exception:
-        return False
-
-
-def _key_lparam(scan: int, is_up: bool, extended: bool, alt_down: bool) -> int:
-    """拼出 WM_KEYDOWN/WM_KEYUP 的 lParam（扫描码 + 扩展/抬起/前次状态位）。"""
-    lp = 1 | ((int(scan) & 0xFF) << 16)
-    if extended:
-        lp |= 1 << 24
-    if alt_down:
-        lp |= 1 << 29              # context code：Alt 组合键要置位
-    if is_up:
-        lp |= (1 << 30) | (1 << 31)
-    return lp
-
-
-def post_keys(hwnd: int, keys: list[str], hold_ms: int = 20) -> bool:
-    """把一组按键直接投递给窗口 ``hwnd``（不需要它是前台窗口）。
-
-    组合键按「先按修饰键 → 再按主键 → 逆序松开」的顺序投递，与真实敲击一致；
-    含 Alt 的组合键改用 WM_SYSKEYDOWN/UP（否则很多程序收不到）。
-    返回是否至少成功投递了一个按键。
-    """
-    if not hwnd or not is_window_valid(hwnd):
-        return False
-    named = [(k, key_vk_scan(k)) for k in (keys or []) if k]
-    named = [(k, m) for k, m in named if m]
-    if not named:
-        return False
-    alt_down = any(k in ("alt", "left alt", "right alt") for k, _ in named)
-    down_msg = WM_SYSKEYDOWN if alt_down else WM_KEYDOWN
-    up_msg = WM_SYSKEYUP if alt_down else WM_KEYUP
-    sent = 0
-    down: list[tuple[int, int, bool]] = []
-    for _k, (vk, scan, ext) in named:
-        if _post_message(hwnd, down_msg, vk, _key_lparam(scan, False, ext, alt_down)):
-            sent += 1
-        down.append((vk, scan, ext))
-    time.sleep(max(int(hold_ms), 8) / 1000.0)
-    for vk, scan, ext in reversed(down):
-        _post_message(hwnd, up_msg, vk, _key_lparam(scan, True, ext, alt_down))
-    return sent > 0
 
 
 def foreground_window_title() -> str:
@@ -1190,16 +844,157 @@ _WINDOW_TITLE_SKIP = {
     "msctfime ui",
 }
 
+# GetSystemMetrics 的索引：整个虚拟桌面（所有显示器合并）的位置与尺寸
+_SM_XVIRTUALSCREEN, _SM_YVIRTUALSCREEN = 76, 77
+_SM_CXVIRTUALSCREEN, _SM_CYVIRTUALSCREEN = 78, 79
+
+
+def _rect_intersects_screen(left: int, top: int, right: int, bottom: int,
+                            screen: tuple[int, int, int, int]) -> bool:
+    """纯函数：矩形与屏幕区域（x, y, 宽, 高）是否有交集。"""
+    sx, sy, sw, sh = screen
+    if sw <= 0 or sh <= 0:
+        return True          # 拿不到屏幕尺寸就不做过滤，宁可多列也不误杀
+    return not (right <= sx or left >= sx + sw
+                or bottom <= sy or top >= sy + sh)
+
+
+def _virtual_screen_rect() -> tuple[int, int, int, int]:
+    """整个虚拟桌面（所有显示器合并）的 (x, y, 宽, 高)。"""
+    import ctypes
+    user32 = ctypes.windll.user32
+    return (int(user32.GetSystemMetrics(_SM_XVIRTUALSCREEN)),
+            int(user32.GetSystemMetrics(_SM_YVIRTUALSCREEN)),
+            int(user32.GetSystemMetrics(_SM_CXVIRTUALSCREEN)),
+            int(user32.GetSystemMetrics(_SM_CYVIRTUALSCREEN)))
+
+
+def _window_rect(hwnd) -> tuple[int, int, int, int] | None:
+    """窗口矩形 (left, top, right, bottom)；拿不到返回 None。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        rect = wintypes.RECT()
+        if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        return (int(rect.left), int(rect.top),
+                int(rect.right), int(rect.bottom))
+    except Exception:
+        return None
+
+
+def window_is_offscreen(hwnd) -> bool:
+    """窗口是否整个落在所有显示器之外。
+
+    有些程序（截图工具、输入法、Qt 的隐藏窗口）会把窗口挪到 -32000 /
+    -21333 这类屏幕外坐标"藏"起来，此时 ``IsWindowVisible`` 仍然是 True，
+    于是它们会出现在「窗口匹配」下拉框里变成噪声条目（例如 Snipaste 的
+    「自定义截屏」窗口）。这种窗口永远不可能成为前台窗口，过滤掉对
+    「前台窗口匹配」没有任何影响。任何异常都返回 False —— 不误杀。
+    """
+    rect = _window_rect(hwnd)
+    if rect is None:
+        return False
+    try:
+        screen = _virtual_screen_rect()
+    except Exception:
+        return False
+    return not _rect_intersects_screen(rect[0], rect[1], rect[2], rect[3],
+                                       screen)
+
 
 def list_window_titles(limit: int = 40) -> list[str]:
     """列出当前所有"可见且有标题"的顶层窗口标题（去重、按标题排序）。
 
-    供「窗口匹配」下拉框使用：只读操作，任何异常都返回空列表，绝不抛错。
-    内部复用 :func:`_enum_windows`（按 z 序枚举，最前面的是当前前台窗口）。
+    供「窗口匹配」下拉框使用：只读操作，任何异常都返回空列表，
+    绝不抛错。按 z 序枚举，所以最前面的通常是当前前台窗口。
+    会跳过本程序自己的窗口、系统输入法之类的噪声窗口，以及被挪到
+    屏幕外"藏"起来的窗口（见 :func:`window_is_offscreen`）。
     """
-    titles = [w.get("title", "") for w in list_windows(limit=999)]
-    unique = sorted({t for t in titles if t}, key=lambda s: s.lower())
+    titles: list[str] = []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        own_pid = os.getpid()
+        try:
+            dwmapi = ctypes.windll.dwmapi
+        except Exception:
+            dwmapi = None
+        enum_proc = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _visit(hwnd, _lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                # 跳过 UWP 隐藏窗口（被 DWM 遮盖的"幽灵窗口"）
+                if dwmapi is not None:
+                    cloaked = wintypes.DWORD(0)
+                    dwmapi.DwmGetWindowAttribute(
+                        hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+                    if cloaked.value:
+                        return True
+                length = int(user32.GetWindowTextLengthW(hwnd))
+                if length <= 0:
+                    return True
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = (buf.value or "").strip()
+                if not title or title.lower() in _WINDOW_TITLE_SKIP:
+                    return True
+                # 跳过被挪到屏幕外藏起来的窗口（它们不可能是前台窗口）
+                if window_is_offscreen(hwnd):
+                    return True
+                pid = wintypes.DWORD(0)
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value == own_pid:
+                    return True
+                titles.append(title)
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(enum_proc(_visit), 0)
+    except Exception:
+        return []
+
+    seen = set()
+    unique: list[str] = []
+    for t in titles:
+        key = t.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(t)
+    unique.sort(key=lambda s: s.lower())
     return unique[:max(1, int(limit))]
+
+
+def match_window(pattern: str, title: str, mode: str = "contains") -> bool:
+    """纯函数：判断窗口标题是否命中匹配条件。
+
+    · ``pattern`` 为空 → 恒为 True（即不限制窗口）
+    · ``contains`` / ``exact`` 大小写不敏感
+    · ``regex`` 使用 ``re.search``；非法正则返回 False 且不抛异常
+    · 未知 mode 按 ``contains`` 处理
+    """
+    pat = (pattern or "").strip()
+    if not pat:
+        return True
+    text = title or ""
+    how = (mode or "contains").strip().lower()
+    try:
+        if how == "exact":
+            return text.strip().lower() == pat.lower()
+        if how == "regex":
+            return re.search(pat, text, re.IGNORECASE) is not None
+        return pat.lower() in text.lower()
+    except re.error:
+        return False          # 正则写错 → 视为不匹配，绝不抛出
+    except Exception:
+        return False
 
 
 # ══════════════════════════════════════════════════════════
@@ -1211,10 +1006,6 @@ class _BaseTask:
         self._pause = threading.Event()
         self._thread: threading.Thread | None = None
         self._window_blocked = False
-        # 目标窗口缓存（_resolve_target 用）：EnumWindows 是重活，
-        # 不能每个按键周期都枚举一遍窗口，所以缓存一小段时间。
-        self._cached_hwnd = 0
-        self._cached_at = 0.0
 
     @property
     def running(self) -> bool:
@@ -1226,28 +1017,8 @@ class _BaseTask:
 
     @property
     def window_blocked(self) -> bool:
-        """只读：当前是否因为窗口条件不满足而停止发送按键。"""
+        """只读：当前是否因为前台窗口不匹配而停止发送按键。"""
         return bool(getattr(self, "_window_blocked", False))
-
-    @property
-    def send_mode(self) -> str:
-        mode = str(getattr(self, "_send_mode", "foreground") or "foreground").lower()
-        return mode if mode in SEND_MODES else "foreground"
-
-    @property
-    def is_bound(self) -> bool:
-        """是否记录了目标窗口（抓取过窗口才有）。"""
-        return bool(getattr(self, "target_pid", 0)
-                    or getattr(self, "target_exe", "")
-                    or getattr(self, "target_hwnd", 0))
-
-    def bind_target(self, hwnd: int = 0, pid: int = 0, exe: str = "") -> None:
-        """记录"这一条任务要作用在哪个窗口/进程上"（抓取窗口时调用）。"""
-        self.target_hwnd = int(hwnd or 0)
-        self.target_pid = int(pid or 0)
-        self.target_exe = str(exe or "")
-        self._cached_hwnd = 0
-        self._cached_at = 0.0
 
     def stop(self):
         self._stop.set()
@@ -1263,89 +1034,22 @@ class _BaseTask:
         else:
             self._pause.set()
 
-    # ── 目标窗口解析 / 生效条件 / 发送 ──
-    def _resolve_target(self, ttl: float = 1.0) -> int:
-        """找出要投递按键的窗口句柄（带缓存，避免高频枚举窗口）。
-
-        · 记录的句柄还有效 → 直接用
-        · 句柄失效（目标程序重开过）→ 按「同进程 + 标题」重新找
-        · 找不到 → 返回 0
-        """
-        now = time.monotonic()
-        if self._cached_hwnd and is_window_valid(self._cached_hwnd):
-            if now - self._cached_at < ttl:
-                return self._cached_hwnd
-        hwnd = int(getattr(self, "target_hwnd", 0) or 0)
-        if hwnd and is_window_valid(hwnd):
-            self._cached_hwnd, self._cached_at = hwnd, now
-            return hwnd
-        hwnd = find_window(getattr(self, "window_match", "") or "",
-                           getattr(self, "window_mode", "contains"),
-                           int(getattr(self, "target_pid", 0) or 0),
-                           getattr(self, "target_exe", "") or "")
-        self._cached_hwnd = hwnd
-        self._cached_at = now
-        return hwnd
-
     def _window_allows(self) -> bool:
-        """当前是否满足发送条件（不同"生效方式"判断依据不同）。
+        """前台窗口是否满足本任务的窗口匹配条件。
 
-        · foreground：前台窗口标题命中模式
-        · process   ：前台窗口属于绑定的进程（没绑定时退化为标题匹配）
-        · window    ：绑定的窗口还在（完全不看前台是谁，也不抢焦点）
-        未设置任何窗口条件时直接返回 True，连 Win32 调用都省掉。
+        未设置匹配条件时直接返回 True，连 Win32 调用都省掉。
         """
-        mode = self.send_mode
         pattern = getattr(self, "window_match", "") or ""
-        if mode == "window":
-            # 绑定窗口：只要目标窗口还在就发，不需要它有焦点
-            if not self.is_bound and not pattern.strip():
-                return True
-            return self._resolve_target() != 0
-
-        if mode == "process":
-            want_pid = int(getattr(self, "target_pid", 0) or 0)
-            if not want_pid:
-                # 只填了标题没抓窗口：按标题找一个窗口，认它的进程
-                want_pid = window_pid(find_window(
-                    pattern, getattr(self, "window_mode", "contains")))
-                if want_pid:
-                    self.target_pid = want_pid     # 记住，下次不用再枚举
-            fg_pid = foreground_window_pid()
-            if want_pid and fg_pid:
-                return fg_pid == want_pid
-            # 进程信息拿不到（或没抓过窗口）→ 退回标题匹配，绝不误封
-            if not pattern.strip():
-                return True
-            return match_window(pattern, foreground_window_title(),
-                                getattr(self, "window_mode", "contains"))
-
         if not pattern.strip():
             return True
         return match_window(pattern, foreground_window_title(),
                             getattr(self, "window_mode", "contains"))
-
-    def _send(self, keys: list[str], hold_ms: int = 20) -> bool:
-        """按当前"生效方式"发送一组按键。
-
-        · window 模式 → 直接把按键投递给绑定的窗口（无需焦点，可后台）
-        · 其它模式   → 走全局按键注入（和手动敲键盘等效）
-        """
-        if self.send_mode == "window":
-            hwnd = self._resolve_target()
-            if hwnd:
-                return post_keys(hwnd, keys, hold_ms)
-            return False
-        keys = [k for k in (keys or []) if k]
-        return send_keys(keys, hold_ms)
 
     def _launch(self, target):
         # 每次启动使用全新的事件对象，避免旧线程未退出时被"复活"
         self._stop = threading.Event()
         self._pause = threading.Event()
         self._window_blocked = False
-        self._cached_hwnd = 0
-        self._cached_at = 0.0
         self._thread = threading.Thread(target=target, daemon=True)
         self._thread.start()
 
@@ -1360,11 +1064,6 @@ class ClickTask(_BaseTask):
     # ── v1.2.0 新增（追加在末尾，保持原有位置参数顺序不变）──
     window_match: str = ""
     window_mode: str = "contains"
-    # ── v1.2.4 新增：生效方式 + 绑定的目标窗口 ──
-    send_mode: str = "foreground"
-    target_pid: int = 0
-    target_exe: str = ""
-    target_hwnd: int = 0
 
     def __post_init__(self):
         _BaseTask.__init__(self)
@@ -1376,13 +1075,6 @@ class ClickTask(_BaseTask):
         self.window_match = str(self.window_match or "").strip()
         mode = str(self.window_mode or "contains").strip().lower()
         self.window_mode = mode if mode in WINDOW_MODES else "contains"
-        how = str(self.send_mode or "foreground").strip().lower()
-        how = how if how in SEND_MODES else "foreground"
-        self.send_mode = how          # 同时更新字段与 _send_mode，两者保持一致
-        self._send_mode = how
-        self._window_blocked = False
-        self._cached_hwnd = 0
-        self._cached_at = 0.0
 
     def start(self):
         if self.running:
@@ -1392,6 +1084,9 @@ class ClickTask(_BaseTask):
 
     def _loop(self):
         kp = parse_keys(self.keys)
+        # 按住时长跟着节拍走：间隔 >= 40ms 时仍是 20ms（老手感），
+        # 间隔更短时才缩短，这样设 16ms 才真的能跑到 ~60 次/秒
+        hold = hold_ms_for(self.interval_ms)
         next_t = time.monotonic()
         while not self._stop.is_set():
             if self._pause.is_set():
@@ -1400,10 +1095,10 @@ class ClickTask(_BaseTask):
                 continue
             if self._window_allows():
                 self._window_blocked = False
-                self._send(kp)
+                send_keys(kp, hold)
                 self.click_count += 1
             else:
-                # 窗口条件不满足：按节拍继续循环，但一个键都不发、不计数
+                # 前台窗口不匹配：按节拍继续循环，但一个键都不发、不计数
                 self._window_blocked = True
             # 按固定节拍推进，避免每次发送的耗时累积成漂移
             next_t += self.interval_ms / 1000.0
@@ -1415,19 +1110,13 @@ class ClickTask(_BaseTask):
 
     def to_dict(self):
         return {"type": "click", "keys": self.keys, "interval": self.interval_ms,
-                "window_match": self.window_match, "window_mode": self.window_mode,
-                "send_mode": self.send_mode, "target_pid": int(self.target_pid),
-                "target_exe": self.target_exe, "target_hwnd": int(self.target_hwnd)}
+                "window_match": self.window_match, "window_mode": self.window_mode}
 
     @classmethod
     def from_dict(cls, d):
         return cls(d.get("keys", "a"), int(d.get("interval", 100)),
                    window_match=d.get("window_match", ""),
-                   window_mode=d.get("window_mode", "contains"),
-                   send_mode=d.get("send_mode", "foreground"),
-                   target_pid=int(d.get("target_pid", 0) or 0),
-                   target_exe=d.get("target_exe", "") or "",
-                   target_hwnd=int(d.get("target_hwnd", 0) or 0))
+                   window_mode=d.get("window_mode", "contains"))
 
 
 @dataclass
@@ -1443,11 +1132,6 @@ class TimerTask(_BaseTask):
     # ── v1.2.0 新增（追加在末尾，保持原有位置参数顺序不变）──
     window_match: str = ""
     window_mode: str = "contains"
-    # ── v1.2.4 新增：生效方式 + 绑定的目标窗口 ──
-    send_mode: str = "foreground"
-    target_pid: int = 0
-    target_exe: str = ""
-    target_hwnd: int = 0
 
     def __post_init__(self):
         _BaseTask.__init__(self)
@@ -1462,10 +1146,6 @@ class TimerTask(_BaseTask):
         self.window_match = str(self.window_match or "").strip()
         mode = str(self.window_mode or "contains").strip().lower()
         self.window_mode = mode if mode in WINDOW_MODES else "contains"
-        how = str(self.send_mode or "foreground").strip().lower()
-        how = how if how in SEND_MODES else "foreground"
-        self.send_mode = how
-        self._send_mode = how
 
     def start(self):
         if self.running:
@@ -1476,10 +1156,11 @@ class TimerTask(_BaseTask):
 
     def _fire(self):
         """依次发送整个按键序列（可被 stop() 中途打断）。"""
+        hold = hold_ms_for(self.gap_ms)   # 间隔调小时按键也按短一点
         for combo in self.seq:
             if self._stop.is_set():
                 return
-            self._send(parse_keys(str(combo)))
+            send_keys(parse_keys(str(combo)), hold)
             self._stop.wait(self.gap_ms / 1000.0)
 
     def _loop(self):
@@ -1516,20 +1197,14 @@ class TimerTask(_BaseTask):
     def to_dict(self):
         return {"type": "timer", "seq": list(self.seq),
                 "minutes": self.minutes, "seconds": self.seconds, "gap": self.gap_ms,
-                "window_match": self.window_match, "window_mode": self.window_mode,
-                "send_mode": self.send_mode, "target_pid": int(self.target_pid),
-                "target_exe": self.target_exe, "target_hwnd": int(self.target_hwnd)}
+                "window_match": self.window_match, "window_mode": self.window_mode}
 
     @classmethod
     def from_dict(cls, d):
         return cls(list(d.get("seq", ["a"])), int(d.get("minutes", 0)),
                    int(d.get("seconds", 10)), int(d.get("gap", 200)),
                    window_match=d.get("window_match", ""),
-                   window_mode=d.get("window_mode", "contains"),
-                   send_mode=d.get("send_mode", "foreground"),
-                   target_pid=int(d.get("target_pid", 0) or 0),
-                   target_exe=d.get("target_exe", "") or "",
-                   target_hwnd=int(d.get("target_hwnd", 0) or 0))
+                   window_mode=d.get("window_mode", "contains"))
 
 
 @dataclass
@@ -1862,30 +1537,16 @@ class TaskRow(QFrame):
             self._set_text(self.prog_lb, f"{m:02d}:{s:02d}")
 
         pattern = (t.window_match or "").strip()
-        mode = t.send_mode
-        if not pattern and mode == "foreground":
+        if not pattern:
             if not self.window_lb.isHidden():
                 self.window_lb.setVisible(False)
         else:
             if blocked:
-                # 该发而没发：说清是哪种方式挡住了
-                why = {"process": "当前前台窗口不属于绑定的进程",
-                       "window": "绑定的窗口已关闭或找不到"}.get(
-                           mode, "当前前台窗口未命中")
-                self._set_text(self.window_lb, f"未发送：{why}")
+                self._set_text(self.window_lb, "窗口不匹配（当前前台窗口未命中）")
                 self._set_role(self.window_lb, "warn")
             else:
                 label = WINDOW_MODE_LABELS.get(t.window_mode, "包含")
-                how = SEND_MODE_LABELS.get(mode, "前台匹配")
-                if mode == "foreground":
-                    text = f"前台窗口{label}：{pattern}"
-                elif mode == "process":
-                    who = t.target_exe or (f"PID {t.target_pid}" if t.target_pid else pattern)
-                    text = f"同进程生效：{who}"
-                else:
-                    who = t.target_exe or pattern or "已绑定窗口"
-                    text = f"后台投递：{who}"
-                self._set_text(self.window_lb, text)
+                self._set_text(self.window_lb, f"窗口{label}：{pattern}")
                 self._set_role(self.window_lb, "window")
             if self.window_lb.isHidden():
                 self.window_lb.setVisible(True)
@@ -2327,10 +1988,6 @@ class PagePanel(QWidget):
         self._stat_text = ""
         self._grab_timer = None
         self._grab_left = 0
-        # 绑定的目标窗口/进程（v1.2.4，抓取窗口时写入）
-        self._target_hwnd = 0
-        self._target_pid = 0
-        self._target_exe = ""
         self._build()
         self._rebuild_rows()
         self._refresh_stats()
@@ -2425,18 +2082,10 @@ class PagePanel(QWidget):
         self.timer_grp.hide()
         al.addWidget(self.timer_grp)
 
-        # 按键生效方式 + 目标窗口（连点 / 定时都适用）
+        # 前台窗口匹配（连点 / 定时都适用）：可编辑下拉，点开即列出当前窗口
         r3 = QHBoxLayout()
         r3.setSpacing(8)
-        r3.addWidget(_label("按键生效方式"))
-        self.send_mode_combo = ThemedComboBox()
-        for m in SEND_MODES:
-            self.send_mode_combo.addItem(SEND_MODE_LABELS[m], m)
-        self.send_mode_combo.setFixedWidth(104)
-        self.send_mode_combo.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.send_mode_combo.currentIndexChanged.connect(self._send_mode_changed)
-        r3.addWidget(self.send_mode_combo)
-        r3.addWidget(_label("窗口"))
+        r3.addWidget(_label("仅在前台窗口匹配时生效"))
         self.window_edit = WindowCombo()
         self.window_edit.setPlaceholderText("留空 = 不限制；点开下拉选窗口，也可直接输入关键词")
         self.window_edit.setToolTip(
@@ -2452,21 +2101,11 @@ class PagePanel(QWidget):
         r3.addWidget(self.window_mode_combo)
         self.window_grab_btn = QPushButton("抓取当前窗口")
         self.window_grab_btn.setObjectName("Ghost")
-        self.window_grab_btn.setToolTip("倒数 3 秒后把当时的前台窗口绑定为目标窗口")
+        self.window_grab_btn.setToolTip("把当前前台窗口的标题填入左侧输入框")
         self.window_grab_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.window_grab_btn.clicked.connect(self._grab_window)
         r3.addWidget(self.window_grab_btn)
         al.addLayout(r3)
-
-        # 生效方式说明 + 绑定状态（换行显示，不挤占上面一行）
-        r4 = QHBoxLayout()
-        r4.setSpacing(8)
-        r4.addSpacing(88)
-        self.send_hint = _label("", "subtle")
-        self.send_hint.setWordWrap(True)
-        r4.addWidget(self.send_hint, 1)
-        al.addLayout(r4)
-        self._send_mode_changed()
 
         add_btn = QPushButton("＋  添加到任务列表")
         add_btn.setObjectName("Primary")
@@ -2510,46 +2149,6 @@ class PagePanel(QWidget):
     def _mode_changed(self, i):
         self.click_grp.setVisible(i == 0)
         self.timer_grp.setVisible(i == 1)
-
-    # ── 按键生效方式 ──
-    def _send_mode(self) -> str:
-        """界面上当前选中的生效方式。"""
-        idx = self.send_mode_combo.currentIndex()
-        return SEND_MODES[idx] if 0 <= idx < len(SEND_MODES) else "foreground"
-
-    def _send_mode_changed(self, *_):
-        """切换生效方式时更新说明文字与绑定状态提示。"""
-        mode = self._send_mode()
-        tail = SEND_MODE_TIPS.get(mode, "")
-        if mode == "window":
-            extra = ("已绑定：%s" % self._target_text()) if self._target_hwnd or self._target_pid \
-                else "尚未绑定窗口 —— 点右侧「抓取当前窗口」绑定目标"
-            tail = f"{tail}\n{extra}"
-        elif mode == "process" and (self._target_pid or self._target_exe):
-            tail = f"{tail}\n已绑定进程：{self._target_text()}"
-        try:
-            self.send_hint.setText(tail)
-            self.send_hint.setToolTip(tail)
-        except Exception:
-            pass
-
-    def _target_text(self) -> str:
-        """绑定目标的简短描述（exe · PID · 标题）。"""
-        bits = []
-        if self._target_exe:
-            bits.append(self._target_exe)
-        if self._target_pid:
-            bits.append(f"PID {self._target_pid}")
-        title = self.window_edit.text().strip()
-        if title:
-            bits.append(title if len(title) <= 24 else title[:24] + "…")
-        return " · ".join(bits) or "（无）"
-
-    def _set_target(self, hwnd: int = 0, pid: int = 0, exe: str = "") -> None:
-        self._target_hwnd = int(hwnd or 0)
-        self._target_pid = int(pid or 0)
-        self._target_exe = str(exe or "")
-        self._send_mode_changed()
 
     # ── 抓取前台窗口 ──
     def _grab_window(self):
@@ -2614,21 +2213,9 @@ class PagePanel(QWidget):
                          for i in range(self.window_edit.count())]:
             # 下拉里没有就补一条，避免看起来"没抓到"
             self.window_edit.insertItem(0, title)
-        # 记下窗口句柄/进程，供「同进程」「绑定窗口」两种方式直接使用
-        hwnd = 0
-        try:
-            import ctypes
-            hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0)
-        except Exception:
-            hwnd = 0
         proc = foreground_process_name()
-        self._set_target(hwnd, window_pid(hwnd), proc)
         msg = f"已抓取窗口标题：{title}" + (f"（{proc}）" if proc else "")
         self._grab_status(msg, 4000)
-        # 抓完顺手切到能后台投递的方式，避免用户还要手动选一次
-        if self._send_mode() == "foreground":
-            idx = SEND_MODES.index("window")
-            self.send_mode_combo.setCurrentIndex(idx)
 
     def _grab_status(self, msg: str, timeout: int = 4000):
         """状态栏提示：状态栏是被动读取的，这里只做尽力而为的提示。"""
@@ -2673,15 +2260,15 @@ class PagePanel(QWidget):
             self.seq_btn.setProperty("filled", filled)
             repolish(self.seq_btn)
 
-    def _window_settings(self) -> tuple[str, str, str]:
-        """读取界面上当前的窗口匹配设置：``(标题模式, 匹配方式, 生效方式)``。"""
+    def _window_settings(self) -> tuple[str, str]:
+        """读取界面上当前的窗口匹配设置。"""
         pattern = self.window_edit.text().strip()
         idx = self.window_mode_combo.currentIndex()
         mode = WINDOW_MODES[idx] if 0 <= idx < len(WINDOW_MODES) else "contains"
-        return pattern, mode, self._send_mode()
+        return pattern, mode
 
     def _add_task(self):
-        pattern, mode, send_mode = self._window_settings()
+        pattern, mode = self._window_settings()
         if pattern and mode == "regex":
             try:
                 re.compile(pattern)
@@ -2689,18 +2276,6 @@ class PagePanel(QWidget):
                 QMessageBox.warning(self, "正则表达式无效",
                                     "窗口标题的正则表达式无法编译，请检查后重试。")
                 return
-        if send_mode in ("process", "window") and not (self._target_pid
-                                                       or self._target_exe
-                                                       or pattern.strip()):
-            QMessageBox.information(
-                self, "提示",
-                "「%s」需要先指定目标窗口：\n"
-                "· 点「抓取当前窗口」自动绑定（推荐）\n"
-                "· 或在窗口下拉里选一个/输入标题关键词"
-                % SEND_MODE_LABELS.get(send_mode, send_mode))
-            return
-        bind = dict(send_mode=send_mode, target_pid=self._target_pid,
-                    target_exe=self._target_exe, target_hwnd=self._target_hwnd)
         if self.mode_combo.currentIndex() == 0:
             keys, err = validate_keys(self.click_key.text())
             if err:
@@ -2713,8 +2288,7 @@ class PagePanel(QWidget):
                 return
             key_text = format_keys(keys) or self.click_key.text().strip()
             self.click_key.setText(key_text)
-            task = ClickTask(key_text, ms, window_match=pattern, window_mode=mode,
-                             **bind)
+            task = ClickTask(key_text, ms, window_match=pattern, window_mode=mode)
         else:
             if not self._timer_seq:
                 QMessageBox.warning(self, "提示", "请先设置按键序列")
@@ -2733,7 +2307,7 @@ class PagePanel(QWidget):
                 QMessageBox.warning(self, "提示", "倒计时不能为 0")
                 return
             task = TimerTask(list(self._timer_seq), m, s, gap,
-                             window_match=pattern, window_mode=mode, **bind)
+                             window_match=pattern, window_mode=mode)
         self.page.tasks.append(task)
         self._rebuild_rows()
         self.dataChanged.emit()
@@ -2841,10 +2415,9 @@ class MainWindow(QMainWindow):
         self._hotkey_names: list[str] = []
         self._setup_hotkey()
         self._center()
+        # 升级提示：旧配置被自动搬到程序目录时说一声，免得用户以为"任务没了"
         if getattr(self, "_migrated_from", None):
-            # 首次以 v1.2.4 运行时把旧配置搬了过来，明确告诉用户
-            self.show_status(
-                f"已把旧配置迁移到程序目录：{CONFIG_PATH}", 8000)
+            self.show_status(f"已把旧配置迁移到程序目录：{CONFIG_PATH}", 8000)
 
     def _build(self):
         central = QWidget()
@@ -2859,7 +2432,7 @@ class MainWindow(QMainWindow):
         hl.setContentsMargins(20, 12, 20, 10)
         hl.setSpacing(10)
         hl.addWidget(_label(APP_NAME, "title"))
-        hl.addWidget(_label("连点 · 定时序列 · 多配置页 · 后台投递", "subtitle"))
+        hl.addWidget(_label("连点 · 定时序列 · 多配置页 · 窗口锁定", "subtitle"))
         hl.addStretch(1)
         self.btn_options = QPushButton("选项")
         self.btn_options.setObjectName("Ghost")
@@ -2973,13 +2546,23 @@ class MainWindow(QMainWindow):
             self.btn_theme.setText(text)
 
     def set_theme(self, name: str, apply: bool = True) -> str:
-        """切换主题并同步按钮文字；apply=True 时立刻整窗重新应用样式表。"""
+        """切换主题并同步按钮文字；apply=True 时立刻整窗重新应用样式表。
+
+        样式表只设到本窗口，不设到 QApplication：程序里所有控件——对话框、
+        下拉弹层、右键菜单、提示气泡——都是本窗口的后代，视觉结果完全一致
+        （选择器结构一样，本窗口这份生效），而 Qt 只需要重算这一棵子树。
+        实测整窗换肤 100~120ms → 35~44ms，点「切换到浅色/深色」不再卡一下。
+        """
         self.theme_name = set_current_theme(name)
         self._sync_theme_button()
         if apply:
             app = QApplication.instance()
-            if app is not None:
-                app.setStyleSheet(make_qss(self.theme_name))
+            if app is not None and app.styleSheet():
+                # main() 启动时给整个应用设过一份样式表。必须先清掉它再设本窗口的：
+                # 反过来的话 Qt 要按"旧 app 表 + 新窗口表"重算一遍（实测 ~170ms），
+                # 先清（~9ms）再设（~30ms）才快。
+                app.setStyleSheet("")
+            self.setStyleSheet(make_qss(self.theme_name))
         return self.theme_name
 
     def _toggle_theme(self):
@@ -2997,9 +2580,9 @@ class MainWindow(QMainWindow):
     def _show_about(self):
         text = (f"{APP_NAME}  v{__version__}\n\n"
                 f"配置文件：\n{CONFIG_PATH}\n\n"
-                "本版默认把配置放在程序（exe）同目录的\n"
-                f"{CONFIG_FILENAME} 里 —— 整个文件夹拷到别的电脑，\n"
-                "配置和任务都会跟着走，不会丢。\n\n"
+                "本版默认把配置放在程序（exe）同目录的 "
+                f"{CONFIG_FILENAME}，\n"
+                "整个文件夹拷到别的电脑，配置和任务都会跟着走，不会丢。\n\n"
                 "全局热键：\n"
                 "  Ctrl+`   开始 / 停止当前配置页\n"
                 "  F6       全部停止（紧急停止）\n\n"
@@ -3149,13 +2732,9 @@ class MainWindow(QMainWindow):
     def _load_config(self):
         """读取配置：兼容 v1.1.0 的旧格式（顶层直接是页面数组）。"""
         self._cfg_theme = None
-        self._migrated_from = None
-        try:
-            # 便携位置还没有配置时，把旧版本留在 %APPDATA% 的配置搬过来，
-            # 老用户升级后不会"任务全没了"（只复制、不删除旧文件）
-            self._migrated_from = migrate_legacy_config()
-        except Exception:
-            self._migrated_from = None
+        # v1.2.4：便携位置还没有配置时，把旧位置（%APPDATA%）的旧配置
+        # 复制过来，别让用户升级完发现"任务全没了"（只复制不删除）
+        self._migrated_from = migrate_legacy_config()
         try:
             if not os.path.exists(CONFIG_PATH):
                 return

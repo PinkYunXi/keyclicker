@@ -798,6 +798,21 @@ class ConfigPathTests(unittest.TestCase):
             self.assertEqual(path, os.path.join(appdata, "KeyClicker", "config.json"))
             self.assertTrue(path.startswith(appdata))   # 绝不落入真实用户目录
 
+    def test_legacy_config_migrated_once(self):
+        """旧位置的配置会被复制到便携位置，只复制不删除、不覆盖已有配置。"""
+        with _AppDirStub() as app_dir:
+            legacy = os.path.join(app_dir, "config.json")
+            with open(legacy, "w", encoding="utf-8") as f:
+                f.write('{"pages": [{"name": "老配置"}]}')
+            dest = os.path.join(app_dir, "clicker_config.json")
+            with _EnvPatch(KEYCLICKER_CONFIG=None, APPDATA=_fake_appdata()):
+                src = kc.migrate_legacy_config(dest, app_dir)
+                self.assertEqual(src, legacy)
+                self.assertTrue(os.path.exists(dest))
+                self.assertTrue(os.path.exists(legacy))     # 旧文件保留
+                # 已经有目标配置时不再迁移，绝不覆盖
+                self.assertIsNone(kc.migrate_legacy_config(dest, app_dir))
+
     def test_ensure_config_dir_creates_directory(self):
         target = os.path.join(tempfile.gettempdir(), "kc_ensure_dir", "config.json")
         folder = os.path.dirname(target)
@@ -1012,6 +1027,26 @@ class UiPolishTests(unittest.TestCase):
             rule = qss[start:end]
             self.assertIn("font-family", rule)
             self.assertNotIn("Consolas", rule)
+
+    def test_seq_button_weight_not_bold(self):
+        """「点击设置序列」文字发虚：微软雅黑 UI 只有 Regular / Light / Bold
+        三档，600 / 700 会落到真正的 Bold，13px 中文一加粗笔画就糊。"""
+        for name in kc.THEME_NAMES:
+            qss = kc.make_qss(name)
+            start = qss.index("QPushButton#SeqBtn")
+            end = qss.index("}", start)
+            rule = qss[start:end]
+            self.assertIn("font-weight: 500", rule)
+            self.assertNotIn("font-weight: 600", rule)
+            self.assertNotIn("font-weight: 700", rule)
+
+    def test_empty_seq_button_uses_solid_foreground(self):
+        """没设置序列时文字要用最实的前景色，不能拿浅色压浅底。"""
+        for name in kc.THEME_NAMES:
+            qss = kc.make_qss(name)
+            start = qss.index('QPushButton#SeqBtn[filled="false"]')
+            end = qss.index("}", start)
+            self.assertIn(kc.THEMES[name]["fg"], qss[start:end])
 
     def test_status_labels_use_main_font(self):
         for name in kc.THEME_NAMES:
@@ -1458,185 +1493,203 @@ class PopupCard23Tests(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════
-#  17. v1.2.4 后台投递（绑定窗口）与三种生效方式
+#  17. 窗口下拉框的信噪比：屏幕外的隐藏窗口不再列出来
 # ══════════════════════════════════════════════════════════
-class BackgroundSendTests(unittest.TestCase):
-    """「绑定窗口」生效方式：全程打桩，既不真发窗口消息也不真注入按键。
+class OffscreenWindowTests(unittest.TestCase):
+    """截图工具、输入法、Qt 隐藏窗口会把窗口挪到屏幕外"藏"起来。
 
-    用户的核心诉求是**不抢前台**也要能把按键送到目标窗口，所以这里除了
-    验证投递本身，还专门盯着"绝不能走全局注入"（全局注入会打进前台窗口）。
+    这类窗口 ``IsWindowVisible`` 仍然是 True，于是会跑到「窗口匹配」下拉框里
+    变成噪声条目 —— 用户报的就是这个：Snipaste 的常驻窗口标题叫「自定义截屏」，
+    停在 (-21333, -21333)，看起来像是本程序自己塞进去的一项。
     """
 
-    def setUp(self):
-        self.calls: list = []
-        self._orig = (kc._post_message, kc.send_keys, kc.is_window_valid,
-                      kc.find_window, kc.foreground_window_pid)
-        kc._post_message = self._fake_post
-        kc.send_keys = self._fake_inject
-        kc.is_window_valid = lambda hwnd: bool(hwnd)
-        kc.find_window = lambda *a, **kw: 0
-        kc.foreground_window_pid = lambda: 0
+    def test_normal_window_intersects_screen(self):
+        self.assertTrue(kc._rect_intersects_screen(
+            100, 100, 900, 700, (0, 0, 1920, 1080)))
 
-    def tearDown(self):
-        (kc._post_message, kc.send_keys, kc.is_window_valid,
-         kc.find_window, kc.foreground_window_pid) = self._orig
+    def test_parked_offscreen_window_is_filtered(self):
+        # 实机抓到的 Snipaste 隐藏窗口：158x26，停在 (-21333, -21333)
+        self.assertFalse(kc._rect_intersects_screen(
+            -21333, -21333, -21175, -21307, (0, 0, 1920, 1080)))
 
-    def _fake_post(self, hwnd, msg, vk, lparam):
-        self.calls.append(("post", int(hwnd), int(msg), int(vk), int(lparam)))
-        return True
+    def test_window_below_screen_is_filtered(self):
+        # 最小化窗口常见的"停"法之一：挪到屏幕下方
+        self.assertFalse(kc._rect_intersects_screen(
+            0, 5000, 800, 5600, (0, 0, 1920, 1080)))
 
-    def _fake_inject(self, keys, hold_ms=20):
-        self.calls.append(("inject", tuple(keys)))
-        return True
+    def test_partially_visible_window_is_kept(self):
+        # 只露出一个角也算看得见 —— 宁可多列，不可误杀
+        self.assertTrue(kc._rect_intersects_screen(
+            -100, -100, 400, 300, (0, 0, 1920, 1080)))
 
-    def _posts(self):
-        return [c for c in self.calls if c[0] == "post"]
+    def test_secondary_monitor_is_kept(self):
+        # 第二块屏在左边（负坐标）时，那块屏上的窗口不能当成屏幕外
+        self.assertTrue(kc._rect_intersects_screen(
+            -1800, 200, -1000, 900, (-1920, 0, 3840, 1080)))
 
-    def _injects(self):
-        return [c for c in self.calls if c[0] == "inject"]
+    def test_unknown_screen_size_does_not_filter(self):
+        # 拿不到屏幕尺寸时不过滤（宁可多列）
+        self.assertTrue(kc._rect_intersects_screen(
+            -21333, -21333, -21175, -21307, (0, 0, 0, 0)))
 
-    # ── 常量表 ──
-    def test_send_modes_have_labels_and_tips(self):
-        self.assertEqual(kc.SEND_MODES, ("foreground", "process", "window"))
-        for m in kc.SEND_MODES:
-            self.assertIn(m, kc.SEND_MODE_LABELS)
-            self.assertIn(m, kc.SEND_MODE_TIPS)
-            self.assertTrue(kc.SEND_MODE_TIPS[m].strip())
+    def test_window_is_offscreen_uses_rect_and_screen(self):
+        real_rect, real_screen = kc._window_rect, kc._virtual_screen_rect
+        kc._window_rect = lambda hwnd: (-21333, -21333, -21175, -21307)
+        kc._virtual_screen_rect = lambda: (0, 0, 1920, 1080)
+        try:
+            self.assertTrue(kc.window_is_offscreen(1234))
+        finally:
+            kc._window_rect, kc._virtual_screen_rect = real_rect, real_screen
 
-    def test_no_mode_steals_foreground(self):
-        """用户明确要求不抢前台：源码里不许出现切前台的调用。"""
+    def test_window_is_offscreen_fails_open(self):
+        """拿不到窗口矩形时不许过滤（任何异常都不能误杀真实窗口）。"""
+        real_rect = kc._window_rect
+        kc._window_rect = lambda hwnd: None
+        try:
+            self.assertFalse(kc.window_is_offscreen(1234))
+        finally:
+            kc._window_rect = real_rect
+
+    def test_enumeration_actually_filters_offscreen(self):
+        """枚举回调里确实调用了过滤 —— 防止哪天这行被顺手指掉。"""
         with open(os.path.join(ROOT, "keyclicker.py"), encoding="utf-8") as f:
             src = f.read()
+        self.assertIn("if window_is_offscreen(hwnd):", src)
+
+
+# ══════════════════════════════════════════════════════════
+#  18. 按键生效方式只剩「前台匹配」：不许再出现后台投递 / 抢前台的痕迹
+# ══════════════════════════════════════════════════════════
+class ForegroundOnlyTests(unittest.TestCase):
+    """v1.2.4 曾试过「绑定窗口（后台投递）」并一度考虑"临时抢前台"，
+
+    用户明确否决：只要**前台窗口匹配**这一条路，而且程序任何时候都不许
+    去抢前台。这里把这两条约束钉在源码上，防止回潮。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(ROOT, "keyclicker.py"), encoding="utf-8") as f:
+            cls.src = f.read()
+
+    def test_version_is_124(self):
+        self.assertEqual(kc.__version__, "1.2.4")
+
+    def test_no_background_delivery_leftovers(self):
+        for bad in ("post_keys", "send_mode", "SEND_MODES", "send_mode_combo",
+                    "WM_KEYDOWN", "WM_SYSKEYDOWN", "target_pid", "bind_target"):
+            self.assertNotIn(bad, self.src, f"回滚没干净：源码里还有 {bad}")
+
+    def test_no_foreground_stealing_calls(self):
         for bad in ("SetForegroundWindow", "SetActiveWindow", "BringWindowToTop",
-                    "AttachThreadInput", "ShowWindow", "keybd_event"):
-            self.assertNotIn(bad, src, f"不应调用 {bad}：那会抢走前台窗口")
+                    "AttachThreadInput", "keybd_event"):
+            self.assertNotIn(bad, self.src, f"不许抢前台：源码里出现了 {bad}")
 
-    # ── post_keys 本身 ──
-    def test_post_keys_combo_order(self):
-        """组合键：先按修饰键 → 再按主键 → 逆序松开。"""
-        kc.post_keys(777, ["ctrl", "a"], hold_ms=8)
-        posts = self._posts()
-        self.assertEqual([c[2] for c in posts],
-                         [kc.WM_KEYDOWN, kc.WM_KEYDOWN,
-                          kc.WM_KEYUP, kc.WM_KEYUP])
-        vks = [c[3] for c in posts]
-        self.assertEqual(vks[0], vks[3])      # ctrl 先按下、最后松开
-        self.assertEqual(vks[1], vks[2])      # a 后按下、先松开
-        self.assertIn(vks[0], (0x11, 0xA2, 0xA3))   # VK_CONTROL / 左右 Ctrl
-        self.assertEqual(vks[1], 0x41)              # VK_A
-        self.assertNotEqual(vks[0], vks[1])
+    def test_only_foreground_send_mode_in_ui(self):
+        """添加任务只按「前台窗口匹配」判断，界面上没有生效方式下拉框。"""
+        self.assertIn("window_match", self.src)
+        self.assertIn("window_mode", self.src)
 
-    def test_post_keys_alt_uses_syskey(self):
-        """含 Alt 的组合键要走 WM_SYSKEYDOWN/UP，否则很多程序收不到。"""
-        kc.post_keys(777, ["alt", "f4"], hold_ms=8)
-        self.assertEqual({c[2] for c in self._posts()},
-                         {kc.WM_SYSKEYDOWN, kc.WM_SYSKEYUP})
 
-    def test_post_keys_lparam_marks_keyup(self):
-        kc.post_keys(777, ["a"], hold_ms=8)
-        down, up = self._posts()
-        self.assertFalse(down[4] & (1 << 31))
-        self.assertTrue(up[4] & (1 << 31))
-        self.assertTrue(up[4] & (1 << 30))
-        self.assertEqual(down[4] & 0xFF, 1)   # 重复次数 = 1
+# ══════════════════════════════════════════════════════════
+#  19. 性能优化：按住时长随节拍自适应 + 换肤走窗口级样式表
+# ══════════════════════════════════════════════════════════
+class PerfPolishTests(unittest.TestCase):
+    """v1.2.4 的两处性能优化，两个都要有护栏：
 
-    def test_post_keys_rejects_bad_input(self):
-        self.assertFalse(kc.post_keys(0, ["a"]))          # 没有窗口
-        self.assertFalse(kc.post_keys(777, []))           # 没有按键
-        self.assertFalse(kc.post_keys(777, [FAKE_KEY]))   # 键名无法识别
-        self.assertEqual(self.calls, [])
+    1. `send_keys` 固定按住 20ms 会把连点速率卡在 ~48 次/秒，
+       间隔设到最小的 16ms 也跑不出来（实测 2 秒只发 96 次）；改成随节拍缩短。
+    2. 换肤原先调 `app.setStyleSheet`，Qt 要重算整个应用（实测 ~120ms）；
+       改成只设主窗口（所有控件都是它的后代），实测 ~40ms。
+    """
 
-    def test_post_keys_refuses_invalid_window(self):
-        kc.is_window_valid = lambda hwnd: False
-        self.assertFalse(kc.post_keys(777, ["a"]))
-        self.assertEqual(self.calls, [])
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(ROOT, "keyclicker.py"), encoding="utf-8") as f:
+            cls.src = f.read()
 
-    # ── 三种生效方式的分流 ──
-    def test_window_mode_posts_and_never_injects(self):
-        """绑定窗口：走窗口消息投递，绝不能退化成全局注入。"""
-        t = kc.ClickTask("a", 100, send_mode="window")
-        t.bind_target(hwnd=4242, pid=77, exe="game.exe")
-        self.assertTrue(t.is_bound)
-        self.assertTrue(t._send(["a"]))
-        self.assertTrue(self._posts())
-        self.assertFalse(self._injects(), "绑定窗口模式不该走全局注入")
-        self.assertTrue(all(c[1] == 4242 for c in self._posts()))
-        self.assertEqual({c[2] for c in self._posts()},
-                         {kc.WM_KEYDOWN, kc.WM_KEYUP})
+    # ── 按住时长 ──
+    def test_hold_ms_unchanged_for_normal_intervals(self):
+        """节拍 >= 40ms（也就是 <= 25 次/秒）时按住时长还是 20ms，手感不变。"""
+        for interval in (40, 50, 100, 200, 1000, 3600000):
+            self.assertEqual(kc.hold_ms_for(interval), 20, interval)
 
-    def test_window_mode_without_target_sends_nothing(self):
-        t = kc.ClickTask("a", 100, send_mode="window")
-        self.assertFalse(t.is_bound)
-        self.assertFalse(t._send(["a"]))
-        self.assertEqual(self.calls, [])
+    def test_hold_ms_shrinks_for_fast_intervals(self):
+        self.assertEqual(kc.hold_ms_for(32), 16)
+        self.assertEqual(kc.hold_ms_for(24), 12)
+        self.assertEqual(kc.hold_ms_for(20), 10)
+        self.assertEqual(kc.hold_ms_for(kc.MIN_INTERVAL_MS), 10)   # 16ms 是界面最小值
+        self.assertEqual(kc.hold_ms_for(1), 10)
+        self.assertEqual(kc.hold_ms_for(0), 10)
+        self.assertEqual(kc.hold_ms_for(-100), 10)
 
-    def test_window_mode_ignores_foreground_title(self):
-        """目标窗口在后台、前台是毫不相干的程序，照样允许发送。"""
-        t = kc.ClickTask("a", 100, send_mode="window")
-        t.bind_target(hwnd=555, pid=9, exe="x.exe")
-        with _StubForeground("完全无关的窗口"):
-            self.assertTrue(t._window_allows())
+    def test_hold_ms_still_fits_inside_the_interval(self):
+        """缩短后的按住时长必须塞得进节拍，否则速率还是上不去（含发送开销 ~1ms）。"""
+        for interval in (16, 20, 24, 32, 40, 100):
+            self.assertLessEqual(kc.hold_ms_for(interval) + 1, interval, interval)
 
-    def test_foreground_and_process_modes_use_global_injection(self):
-        for mode in ("foreground", "process"):
-            self.calls.clear()
-            t = kc.ClickTask("a", 100, send_mode=mode)
-            self.assertTrue(t._send(["a"]))
-            self.assertEqual(len(self._injects()), 1, mode)
-            self.assertFalse(self._posts(), mode)
+    def test_hold_ms_survives_bad_input(self):
+        self.assertEqual(kc.hold_ms_for(None), 20)
+        self.assertEqual(kc.hold_ms_for("abc"), 20)
+        self.assertEqual(kc.hold_ms_for(100, default=30), 30)
+        self.assertEqual(kc.hold_ms_for(20, default=30), 10)
 
-    def test_invalid_send_mode_falls_back_to_foreground(self):
-        self.assertEqual(kc.ClickTask("a", 100, send_mode="bogus").send_mode,
-                         "foreground")
-        self.assertEqual(kc.TimerTask(["a"], 0, 3, send_mode=None).send_mode,
-                         "foreground")
+    def test_send_keys_still_floors_hold_at_8ms(self):
+        """下限 8ms 不能松：按太短有些程序收不到按键。"""
+        slept = []
+        real_press, real_release = kc.keyboard.press, kc.keyboard.release
+        real_sleep = kc.time.sleep
+        kc.keyboard.press = lambda k: None
+        kc.keyboard.release = lambda k: None
+        kc.time.sleep = lambda s: slept.append(s)
+        try:
+            kc.send_keys(["a"], 1)      # 请求 1ms → 按 8ms
+            kc.send_keys(["a"], 20)     # 请求 20ms → 按 20ms
+        finally:
+            kc.keyboard.press, kc.keyboard.release = real_press, real_release
+            kc.time.sleep = real_sleep
+        self.assertEqual(slept, [0.008, 0.02])
 
-    # ── 目标解析 / 进程绑定 ──
-    def test_bind_target_resets_cached_handle(self):
-        t = kc.ClickTask("a", 100, send_mode="window")
-        t.bind_target(hwnd=111, pid=1, exe="a.exe")
-        self.assertEqual(t._resolve_target(), 111)
-        t.bind_target(hwnd=222, pid=2, exe="b.exe")
-        self.assertEqual(t._cached_hwnd, 0)          # 换绑必须清缓存
-        self.assertEqual(t._resolve_target(), 222)
+    def test_click_loop_passes_shortened_hold(self):
+        """连点线程真的把缩短后的按住时长传给了 send_keys（默认值 20 会卡速率）。"""
+        seen = []
+        real = kc.send_keys
+        kc.send_keys = lambda keys, hold_ms=20: seen.append(hold_ms) or True
+        task = kc.ClickTask("a", kc.MIN_INTERVAL_MS)
+        try:
+            task.start()
+            time.sleep(0.12)
+        finally:
+            task.stop()
+            kc.send_keys = real
+        self.assertTrue(seen, "0.12 秒里一次都没发出去")
+        self.assertEqual(set(seen), {10}, f"按住时长应为 10ms，实际 {set(seen)}")
 
-    def test_resolve_target_refinds_by_process_after_handle_dies(self):
-        """目标程序重开后句柄失效 → 按「同进程 + 标题」重新找到新窗口。"""
-        seen = {}
+    # ── 换肤 ──
+    def test_theme_applied_to_window_not_app(self):
+        """样式表只能设到主窗口；app 级那份只允许保留 main() 里的一次性设置。"""
+        self.assertIn("self.setStyleSheet(make_qss(self.theme_name))", self.src)
+        self.assertNotIn("app.setStyleSheet(make_qss(self.theme_name))", self.src)
 
-        def fake_find(pattern, mode, pid=0, exe="", windows=None):
-            seen.update(pattern=pattern, mode=mode, pid=pid, exe=exe)
-            return 999
-
-        t = kc.ClickTask("a", 100, send_mode="window", window_match="游戏",
-                         window_mode="contains")
-        t.bind_target(hwnd=111, pid=1, exe="a.exe")
-        kc.find_window = fake_find
-        kc.is_window_valid = lambda hwnd: hwnd != 111        # 旧句柄已失效
-        self.assertEqual(t._resolve_target(), 999)
-        self.assertEqual(seen["pid"], 1)             # 认准绑定的进程
-        self.assertEqual(seen["exe"], "a.exe")
-        self.assertEqual(seen["pattern"], "游戏")
-
-    # ── 存盘往返 ──
-    def test_send_mode_and_target_roundtrip(self):
-        t = kc.ClickTask("a", 100, send_mode="window")
-        t.bind_target(hwnd=1, pid=2, exe="g.exe")
-        d = t.to_dict()
-        self.assertEqual(d["send_mode"], "window")
-        self.assertEqual((d["target_hwnd"], d["target_pid"], d["target_exe"]),
-                         (1, 2, "g.exe"))
-        back = kc.ClickTask.from_dict(json.loads(json.dumps(d,
-                                                            ensure_ascii=False)))
-        self.assertEqual(back.send_mode, "window")
-        self.assertEqual((back.target_hwnd, back.target_pid, back.target_exe),
-                         (1, 2, "g.exe"))
-
-    def test_legacy_page_without_send_mode(self):
-        legacy = {"type": "click", "keys": "a", "interval": 50}
-        t = kc.ClickTask.from_dict(legacy)
-        self.assertEqual(t.send_mode, "foreground")
-        self.assertFalse(t.is_bound)
+    def test_theme_switch_sets_window_stylesheet_and_clears_app(self):
+        app = QApplication.instance()
+        before = kc.current_theme()
+        with _TempConfig():
+            win = kc.MainWindow()
+            try:
+                app.setStyleSheet(kc.make_qss("dark"))     # 模拟 main() 的启动设置
+                win.set_theme("light")
+                self.assertEqual(win.styleSheet(), kc.make_qss("light"))
+                self.assertEqual(app.styleSheet(), "", "旧的 app 级样式表没清掉")
+                win.set_theme("dark")
+                self.assertEqual(win.styleSheet(), kc.make_qss("dark"))
+                # 对话框是主窗口的后代，样式表沿对象树继承，主题必须跟着走
+                dlg = kc.SequenceEditor(win, ["a", "ctrl+b"])
+                self.assertIsNotNone(dlg.styleSheet() or win.styleSheet())
+            finally:
+                win.close()
+                app.setStyleSheet("")
+        kc.set_current_theme(before)
 
 
 if __name__ == "__main__":
