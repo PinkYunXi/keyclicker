@@ -25,6 +25,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import keyclicker as kc  # noqa: E402
+from PyQt6.QtCore import QEvent, Qt  # noqa: E402
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 _app = None
@@ -1317,6 +1318,137 @@ class UiPolish22Tests(unittest.TestCase):
         kc.repolish(panel.seq_btn)
         kc.repolish(panel.mode_combo)
         kc.repolish(None)          # 不允许抛异常
+
+
+# ══════════════════════════════════════════════════════════
+#  13. v1.2.3 修复：下拉弹层「直角白框」→ 真圆角卡片
+# ══════════════════════════════════════════════════════════
+class PopupCard23Tests(unittest.TestCase):
+    """v1.2.3：弹层容器自绘圆角卡片，四角透明，不再出现突兀的方角框。"""
+
+    def setUp(self):
+        self.cfg = _TempConfig()
+        self.cfg.__enter__()
+        self.win = kc.MainWindow()
+        self.win.show()
+        QApplication.processEvents()
+
+    def tearDown(self):
+        self.win.close()
+        self.cfg.__exit__(None, None, None)
+
+    # ── 工具 ──
+    @staticmethod
+    def _apply_theme(name):
+        kc.set_current_theme(name)
+        QApplication.instance().setStyleSheet(kc.make_qss(name))
+
+    def _popup_image(self, combo):
+        """弹出下拉并把弹层窗口截图（含 alpha 通道）。"""
+        combo.showPopup()
+        QApplication.processEvents()
+        img = combo.view().window().grab().toImage()
+        combo.hidePopup()
+        QApplication.processEvents()
+        return img
+
+    def _new_combo(self, items=("包含", "精确", "正则")):
+        combo = kc.ThemedComboBox()
+        combo.addItems(list(items))
+        combo.resize(180, 30)
+        combo.show()
+        QApplication.processEvents()
+        return combo
+
+    # ── 圆角 ──
+    def test_popup_corners_are_transparent(self):
+        """四角必须是透明像素（= 真圆角）；方角白底会把角填成不透明。"""
+        for name in kc.THEME_NAMES:
+            self._apply_theme(name)
+            combo = self._new_combo()
+            img = self._popup_image(combo)
+            self.assertGreater(img.width(), 20)
+            self.assertGreater(img.height(), 20)
+            corners = ((0, 0), (img.width() - 1, 0),
+                       (0, img.height() - 1), (img.width() - 1, img.height() - 1))
+            for px, py in corners:
+                alpha = (int(img.pixel(px, py)) >> 24) & 255
+                self.assertLess(alpha, 40, f"{name} 主题弹层四角不是圆角")
+            combo.close()
+
+    def test_popup_card_color_follows_theme(self):
+        """卡面颜色跟随主题：浅色 #ffffff / 深色 #0d1117。"""
+        for name in kc.THEME_NAMES:
+            self._apply_theme(name)
+            combo = self._new_combo()
+            img = self._popup_image(combo)
+            center = int(img.pixel(img.width() // 2, 2)) & 0xFFFFFF
+            self.assertEqual(center, _rgb_key(kc.THEMES[name]["field_bg"]),
+                             f"{name} 主题弹层卡面颜色不对")
+            combo.close()
+
+    def test_popup_container_is_rounded_card(self):
+        """弹层容器带对象名 / 半透明属性，并挂上圆角卡片过滤器。"""
+        combo = self.win.panels[0].mode_combo
+        combo.showPopup()
+        QApplication.processEvents()
+        popup = combo.view().window()
+        self.assertEqual(popup.objectName(), "ComboPopup")
+        self.assertTrue(popup.testAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground))
+        self.assertTrue(popup.isWindow())
+        self.assertIsNot(popup, self.win)
+        self.assertIsInstance(combo._popup_filter, kc._PopupCardFilter)
+        self.assertIs(combo._popup_filter.parent(), combo)
+        combo.hidePopup()
+
+    def test_popup_card_filter_survives_reopen(self):
+        """反复弹出后圆角依然生效（防 Qt 重建容器导致失效）。"""
+        combo = self.win.panels[0].mode_combo
+        for _ in range(3):
+            combo.showPopup()
+            QApplication.processEvents()
+            popup = combo.view().window()
+            combo.hidePopup()
+            QApplication.processEvents()
+        self.assertTrue(popup.testAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground))
+        self.assertEqual(popup.objectName(), "ComboPopup")
+        alpha = (int(popup.grab().toImage().pixel(0, 0)) >> 24) & 255
+        self.assertLess(alpha, 40)
+
+    def test_popup_filter_ignores_other_events(self):
+        """过滤器只接管 Paint，其它事件必须放行（否则列表交互会坏）。"""
+        combo = self.win.panels[0].mode_combo
+        flt = combo._popup_filter
+        for etype in (QEvent.Type.MouseMove, QEvent.Type.KeyPress,
+                      QEvent.Type.Show, QEvent.Type.Hide):
+            self.assertFalse(flt.eventFilter(combo, QEvent(etype)))
+
+    def test_popup_filter_is_defensive(self):
+        """自绘出错时不能吞掉绘制（回退默认绘制，避免弹层空白）。"""
+        combo = self.win.panels[0].mode_combo
+
+        class _Boom(kc._PopupCardFilter):
+            def _paint_card(self, widget):
+                raise RuntimeError("boom")
+
+        flt = _Boom(combo)
+        self.assertFalse(flt.eventFilter(combo, QEvent(QEvent.Type.Paint)))
+
+    def test_popup_scroller_arrows_still_paint(self):
+        """长列表的滚动箭头是弹层子控件，不能被圆角卡片覆盖掉。"""
+        for name in kc.THEME_NAMES:
+            self._apply_theme(name)
+            combo = self._new_combo([f"窗口标题 {i} - 记事本" for i in range(30)])
+            img = self._popup_image(combo)
+            top_band = [int(img.pixel(x, y)) & 0xFFFFFF
+                        for y in range(0, min(14, img.height()))
+                        for x in range(img.width())]
+            card = _rgb_key(kc.THEMES[name]["field_bg"])
+            arrowish = [c for c in top_band if c not in (card, 0x000000)]
+            self.assertGreater(len(arrowish), 4, f"{name} 主题滚动箭头看不见了")
+            combo.close()
 
 
 if __name__ == "__main__":

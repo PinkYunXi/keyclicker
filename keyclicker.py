@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass, field
 from string import Template
 
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 __all__ = [
     "main", "parse_keys", "normalize_key", "is_valid_key", "validate_keys",
     "send_keys", "make_qss", "repolish", "current_theme", "set_current_theme",
@@ -43,7 +43,9 @@ __all__ = [
 ]
 
 try:
-    from PyQt6.QtCore import Qt, QEvent, QTimer, QSize, pyqtSignal, QObject
+    from PyQt6.QtCore import (
+        Qt, QEvent, QTimer, QSize, QRectF, pyqtSignal, QObject,
+    )
     from PyQt6.QtGui import (
         QColor, QIcon, QIntValidator, QPainter, QPainterPath, QPen,
     )
@@ -384,11 +386,18 @@ QComboBox QLineEdit {
     background: transparent; border: none; padding: 0; margin: 0; outline: none;
     selection-background-color: $accent; selection-color: $on_emphasis;
 }
-/* 下拉弹层：整体圆角 + 四周留白，配合无边框半透明弹窗，不再有直角外框 */
-QComboBoxPrivateContainer { background: transparent; border: none; }
+/* 下拉弹层：弹层容器是 Qt 私有类 QComboBoxPrivateContainer（没有 Q_OBJECT，
+   写类名选择器匹配不上，Qt 会退回默认的直角白底 + 1px 方框），所以改用
+   对象名 ComboPopup（见 ThemedComboBox._round_popup）+ WA_StyledBackground，
+   由容器画真正的圆角卡片；列表本体（及其 viewport）全透明，四角不会再被
+   方形的白底填平，浅色/深色下都不会看到突兀的直角框 */
+QWidget#ComboPopup {
+    background-color: $field_bg; border: 1px solid $border;
+    border-radius: 9px;
+}
 QComboBox QAbstractItemView {
-    background-color: $field_bg; color: $fg; border: 1px solid $border;
-    border-radius: 8px; padding: 6px; outline: none;
+    background: transparent; color: $fg; border: none;
+    border-radius: 9px; padding: 6px; outline: none;
     selection-background-color: transparent; selection-color: $fg;
 }
 /* 列表项完全交给 RoundedItemDelegate 自绘（圆角高亮 + 当前项对勾），
@@ -1638,6 +1647,45 @@ class RoundedItemDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class _PopupCardFilter(QObject):
+    """给下拉弹层容器自绘圆角卡片，压掉 Qt 默认的直角白底 + 1px 方框。
+
+    弹层容器是 Qt 私有类 QComboBoxPrivateContainer：它自己实现 paintEvent，
+    用 QStyle::PE_PanelMenu 画出一块**直角**底板（浅色白底 + 深色 1px 方框，
+    深色主题下则是接近底色的方框，所以「有框但不明显」）。QSS 对这块底板
+    无能为力，因此这里用事件过滤器接管 Paint 事件：自己画一张圆角卡片，
+    然后返回 True 阻止默认绘制。容器带 WA_TranslucentBackground，圆角以外
+    的像素保持透明，四角就是真正的圆角，不再出现突兀的直角框。
+    """
+
+    RADIUS = 9.0
+
+    def __init__(self, combo: "ThemedComboBox"):
+        super().__init__(combo)
+        self._combo = combo
+
+    def eventFilter(self, obj, event):      # noqa: N802 - Qt 命名
+        if event.type() == QEvent.Type.Paint:
+            try:
+                self._paint_card(obj)
+            except Exception:
+                return False
+            return True
+        return False
+
+    def _paint_card(self, widget) -> None:
+        tokens = THEMES[current_theme()]
+        painter = QPainter(widget)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            rect = QRectF(widget.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+            painter.setPen(QPen(QColor(tokens["border"]), 1.0))
+            painter.setBrush(QColor(tokens["field_bg"]))
+            painter.drawRoundedRect(rect, self.RADIUS, self.RADIUS)
+        finally:
+            painter.end()
+
+
 class ThemedComboBox(QComboBox):
     """统一下拉框：自带圆角箭头 + 圆角半透明弹层 + 圆角列表项。"""
 
@@ -1645,14 +1693,22 @@ class ThemedComboBox(QComboBox):
         super().__init__(parent)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setItemDelegate(RoundedItemDelegate(self))
+        self._popup_filter = _PopupCardFilter(self)
         view = self.view()
         if view is not None:
             view.setMouseTracking(True)         # 让列表项能收到 hover
             view.setFrameShape(QFrame.Shape.NoFrame)
             self._round_popup(view)
 
+    def showPopup(self):                    # noqa: N802 - Qt 命名
+        """每次弹出前再确认一次弹层外观（幂等，防止 Qt 重建容器后失效）。"""
+        view = self.view()
+        if view is not None:
+            self._round_popup(view)
+        super().showPopup()
+
     def _round_popup(self, view) -> None:
-        """把下拉弹层改成无边框 + 半透明，圆角才不会被直角窗口切掉。
+        """把下拉弹层改成无边框 + 半透明的圆角卡片。
 
         弹层本身就是独立的顶层窗口，与主窗口无关，所以改它的窗口标志
         不会影响主界面；这里还额外做了两层防御，确保不会误伤自己的窗口。
@@ -1665,7 +1721,15 @@ class ThemedComboBox(QComboBox):
             return
         try:
             popup.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+            popup.setObjectName("ComboPopup")
+            popup.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
             popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            popup.installEventFilter(self._popup_filter)
+        except Exception:
+            pass
+        try:                                    # 列表本体不画底色，露出容器圆角
+            view.setAutoFillBackground(False)
+            view.viewport().setAutoFillBackground(False)
         except Exception:
             pass
 
