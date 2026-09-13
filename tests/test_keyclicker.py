@@ -949,5 +949,154 @@ class WindowPanelTests(unittest.TestCase):
             win.close()
 
 
+# ══════════════════════════════════════════════════════════
+#  11. 界面细节（序列区配色 / 字体 / 下拉 hover / 焦点）
+# ══════════════════════════════════════════════════════════
+class UiPolishTests(unittest.TestCase):
+    """v1.2.1 的界面打磨：序列区底色、字体统一、下拉交互、点空白失焦。"""
+
+    def setUp(self):
+        self.cfg = _TempConfig()
+        self.cfg.__enter__()
+        self.win = kc.MainWindow()
+
+    def tearDown(self):
+        self.win.close()
+        self.cfg.__exit__(None, None, None)
+
+    # ── 配色令牌 ──
+    def test_seq_tokens_exist_and_differ_between_themes(self):
+        for name in kc.THEME_NAMES:
+            theme = kc.THEMES[name]
+            for token in ("seq_bg", "seq_border", "seq_fg", "field_bg", "field_hover"):
+                self.assertIn(token, theme)
+        for token in ("seq_bg", "seq_border", "seq_fg"):
+            self.assertNotEqual(kc.THEMES["light"][token], kc.THEMES["dark"][token])
+
+    def test_seq_area_does_not_blend_into_card(self):
+        """序列区底色必须和卡片底色不同，否则浅色下整块区域看不出来。"""
+        for name in kc.THEME_NAMES:
+            theme = kc.THEMES[name]
+            self.assertNotEqual(theme["seq_bg"], theme["canvas_subtle"])
+            self.assertNotEqual(theme["seq_bg"], theme["canvas"])
+
+    # ── 样式表 ──
+    def test_qss_has_timer_group_and_combo_hover(self):
+        for name in kc.THEME_NAMES:
+            qss = kc.make_qss(name)
+            self.assertIn("QWidget#TimerGroup", qss)
+            self.assertIn("QComboBox:hover", qss)
+            self.assertIn("QComboBox QLineEdit", qss)
+            self.assertIn(kc.THEMES[name]["seq_bg"], qss)
+
+    def test_seq_button_uses_main_font(self):
+        """「点击设置序列」用中文字体，不能落到等宽字体上造成违和感。"""
+        for name in kc.THEME_NAMES:
+            qss = kc.make_qss(name)
+            start = qss.index("QPushButton#SeqBtn")
+            end = qss.index("}", start)
+            rule = qss[start:end]
+            self.assertIn("font-family", rule)
+            self.assertNotIn("Consolas", rule)
+
+    def test_status_labels_use_main_font(self):
+        for name in kc.THEME_NAMES:
+            qss = kc.make_qss(name)
+            for role in ("progress", "capture", "seqbox"):
+                start = qss.index('QLabel[role="%s"]' % role)
+                end = qss.index("}", start)
+                self.assertNotIn("Consolas", qss[start:end])
+
+    # ── 窗口下拉框 ──
+    def test_panel_uses_editable_window_combo(self):
+        panel = self.win.panels[0]
+        self.assertIsInstance(panel.window_edit, kc.WindowCombo)
+        self.assertTrue(panel.window_edit.isEditable())
+
+    def test_window_combo_behaves_like_line_edit(self):
+        combo = kc.WindowCombo()
+        self.assertTrue(combo.isEditable())
+        combo.setText("记事本")
+        self.assertEqual(combo.text(), "记事本")
+        seen = []
+        combo.textChanged.connect(seen.append)
+        combo.setEditText("计算器")
+        self.assertIn("计算器", seen)
+        combo.setText(None)
+        self.assertEqual(combo.text(), "")
+
+    def test_window_combo_refresh_keeps_typed_text(self):
+        combo = kc.WindowCombo()
+        combo.setText("我的关键词")
+        count = combo.refresh_windows()
+        self.assertIsInstance(count, int)
+        self.assertGreaterEqual(count, 0)
+        self.assertEqual(combo.text(), "我的关键词")
+
+    def test_list_window_titles_shape(self):
+        titles = kc.list_window_titles()
+        self.assertIsInstance(titles, list)
+        self.assertLessEqual(len(titles), 40)
+        for t in titles:
+            self.assertIsInstance(t, str)
+            self.assertEqual(t, t.strip())
+            self.assertTrue(t)
+        lowered = [t.lower() for t in titles]
+        self.assertEqual(len(set(lowered)), len(lowered))   # 已去重
+        self.assertEqual(lowered, sorted(lowered))          # 已排序
+        self.assertLessEqual(len(kc.list_window_titles(1)), 1)
+
+    def test_grab_window_fills_keyword(self):
+        panel = self.win.panels[0]
+        old_title = kc.foreground_window_title
+        old_list = kc.list_window_titles
+        kc.foreground_window_title = lambda: "无标题 - 记事本"
+        kc.list_window_titles = lambda limit=40: ["无标题 - 记事本"]
+        try:
+            panel._grab_window()
+        finally:
+            kc.foreground_window_title = old_title
+            kc.list_window_titles = old_list
+        self.assertEqual(panel.window_edit.text(), "无标题 - 记事本")
+        self.assertIn("无标题 - 记事本", [panel.window_edit.itemText(i)
+                                      for i in range(panel.window_edit.count())])
+
+    # ── 焦点 ──
+    def test_blank_click_clears_focus_but_input_click_does_not(self):
+        from PyQt6.QtCore import QEvent, QPointF, Qt
+        from PyQt6.QtGui import QMouseEvent
+
+        panel = self.win.panels[0]
+        self.win.show()
+        QApplication.processEvents()
+        panel.click_key.setFocus()
+        QApplication.processEvents()
+        if QApplication.focusWidget() is not panel.click_key:
+            self.skipTest("离屏平台未提供真实键盘焦点")
+
+        def _press(target):
+            ev = QMouseEvent(
+                QEvent.Type.MouseButtonPress, QPointF(3, 3), QPointF(3, 3),
+                Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier)
+            QApplication.sendEvent(target, ev)
+            QApplication.processEvents()
+
+        _press(panel.click_key)          # 点到输入框上：焦点保留
+        self.assertTrue(panel.click_key.hasFocus())
+        _press(panel)                    # 点到空白处：焦点释放
+        self.assertFalse(panel.click_key.hasFocus())
+
+    # ── 图标 ──
+    def test_app_icon_helper_is_safe(self):
+        from PyQt6.QtGui import QIcon
+
+        self.assertIsInstance(kc.app_icon(), QIcon)
+        self.assertTrue(kc._resource_path("logo.png").endswith("logo.png"))
+        self.assertIsInstance(self.win.windowIcon(), QIcon)
+        if not kc.app_icon().isNull():       # 仓库里带了 logo 时必须真的装上
+            self.assertFalse(self.win.windowIcon().isNull())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

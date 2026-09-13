@@ -9,7 +9,9 @@
      界面是纯 QtWidgets 光栅绘制，不使用 OpenGL，运行时不会加载它们。
   2. Qt 翻译文件（*.qm）：程序没有安装 QTranslator，界面文案是代码里的中文，用不到。
   3. 无用的 Qt 插件：只保留 platforms（windows / minimal / offscreen），
-     去掉 imageformats、iconengines、styles、generic 等（界面不用图标/图片文件）。
+     去掉 imageformats、iconengines、styles、generic 等。
+     程序图标用的是 logo.png（PNG 解码内置于 QtGui，不依赖 imageformats 插件），
+     因此去掉图片插件也不影响图标显示。
   4. 无用的 Python 模块：tkinter、unittest、numpy、PyQt6 的其它子模块等。
 """
 
@@ -70,7 +72,7 @@ a = Analysis(
     ["keyclicker.py"],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[("logo.png", ".")],   # 程序图标（窗口 / 任务栏），运行时由 app_icon() 读取
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -93,6 +95,7 @@ exe = EXE(
     a.datas,
     [],
     name="KeyClicker",
+    icon="logo.ico",           # exe 图标（含 16~256 多尺寸帧）
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
