@@ -5,6 +5,8 @@
   · 定时序列：倒计时结束后依次发送一串按键，可循环触发
   · 多配置页：多套互不干扰的任务，配置自动保存（原子写入）
   · 按键录入：连点按键与定时序列都能"按下即录入"，无需手写键名
+  · 窗口锁定：仅当前台窗口标题匹配时才发送按键
+  · 双主题：GitHub Primer 风格浅色 / 深色，一键切换并记忆
   · 全局热键：Ctrl+` 开始/停止当前页，F6 全部停止（紧急停止）
 
 运行：
@@ -25,12 +27,16 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from string import Template
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __all__ = [
-    "main", "parse_keys", "normalize_key", "validate_keys", "send_keys",
+    "main", "parse_keys", "normalize_key", "is_valid_key", "validate_keys",
+    "send_keys", "make_qss", "repolish", "current_theme", "set_current_theme",
+    "system_theme", "resolve_config_path", "ensure_config_dir",
+    "foreground_window_title", "foreground_process_name", "match_window",
     "ClickTask", "TimerTask", "Page", "KeyRecorder", "KeyCaptureDialog",
-    "SequenceEditor", "PagePanel", "MainWindow",
+    "SequenceEditor", "TaskRow", "PagePanel", "MainWindow",
 ]
 
 try:
@@ -39,7 +45,7 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit,
         QComboBox, QScrollArea, QFrame, QVBoxLayout, QHBoxLayout, QDialog,
-        QMessageBox, QSizePolicy, QStackedWidget, QInputDialog,
+        QMessageBox, QSizePolicy, QStackedWidget, QInputDialog, QMenu,
     )
 
     import keyboard
@@ -55,31 +61,355 @@ except ImportError as e:
     sys.exit(1)
 
 
-# ── 主题色 ──
-BG       = "#1e1e2e"
-BG_CARD  = "#2a2a3e"
-BG_ENTRY = "#363650"
-BG_HOVER = "#41415f"
-FG       = "#cdd6f4"
-FG_DIM   = "#6c7086"
-ACCENT   = "#89b4fa"
-GREEN    = "#a6e3a1"
-RED      = "#f38ba8"
-YELLOW   = "#f9e2af"
-ORANGE   = "#fab387"
-PURPLE   = "#cba6f7"
-BORDER   = "#45475a"
+# ══════════════════════════════════════════════════════════
+#  主题（GitHub Primer 色板）
+# ══════════════════════════════════════════════════════════
+# 所有颜色都集中在这里，界面控件一律不写死颜色，只设置动态属性，
+# 由 make_qss() 生成的样式表按属性选择器上色 —— 这样切换主题时
+# 只要重新 setStyleSheet 一次，整个窗口立刻换肤。
+THEMES = {
+    "light": {
+        "canvas": "#ffffff",
+        "canvas_subtle": "#f6f8fa",
+        "canvas_inset": "#f6f8fa",
+        "border": "#d0d7de",
+        "border_muted": "#d8dee4",
+        "fg": "#1f2328",
+        "fg_muted": "#59636e",
+        "fg_subtle": "#818b98",
+        "accent": "#0969da",
+        "success": "#1a7f37",
+        "success_emphasis": "#1f883d",
+        "danger": "#cf222e",
+        "danger_emphasis": "#cf222e",
+        "attention": "#9a6700",
+        "done": "#8250df",
+        "btn_bg": "#f6f8fa",
+        "btn_hover": "#eef1f4",
+        "btn_active": "#e7ebef",
+        "btn_fg": "#24292f",
+        "on_emphasis": "#ffffff",
+        "tooltip_bg": "#1f2328",
+        "tooltip_fg": "#ffffff",
+    },
+    "dark": {
+        "canvas": "#0d1117",
+        "canvas_subtle": "#161b22",
+        "canvas_inset": "#010409",
+        "border": "#30363d",
+        "border_muted": "#21262d",
+        "fg": "#e6edf3",
+        "fg_muted": "#8b949e",
+        "fg_subtle": "#6e7681",
+        "accent": "#2f81f7",
+        "success": "#3fb950",
+        "success_emphasis": "#238636",
+        "danger": "#f85149",
+        "danger_emphasis": "#da3633",
+        "attention": "#d29922",
+        "done": "#a371f7",
+        "btn_bg": "#21262d",
+        "btn_hover": "#30363d",
+        "btn_active": "#282e33",
+        "btn_fg": "#c9d1d9",
+        "on_emphasis": "#ffffff",
+        "tooltip_bg": "#161b22",
+        "tooltip_fg": "#e6edf3",
+    },
+}
+
+THEME_NAMES = ("light", "dark")
+DEFAULT_THEME = "dark"
+THEME_LABELS = {"light": "浅色", "dark": "深色"}
 
 FONT_MAIN = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
 
-APP_NAME    = "键盘连点器"
-# 打包成 exe 后 __file__ 指向临时解压目录，需改用 exe 所在目录存放配置
-if getattr(sys, "frozen", False):
-    _APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
-else:
-    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(_APP_DIR, "clicker_config.json")
+APP_NAME = "键盘连点器"
+CONFIG_VERSION = 2
+
+# 当前主题（模块级，make_qss() 不带参数时用它）
+_current_theme = DEFAULT_THEME
+
+
+def normalize_theme(name) -> str:
+    """把任意输入归一化为合法主题名；无法识别时回退到当前主题。"""
+    if isinstance(name, str):
+        key = name.strip().lower()
+        if key in THEMES:
+            return key
+    return _current_theme
+
+
+def current_theme() -> str:
+    """当前主题名（"light" / "dark"）。"""
+    return _current_theme
+
+
+def set_current_theme(name: str) -> str:
+    """设置当前主题；非法名字保持不变。返回生效后的主题名。"""
+    global _current_theme
+    if isinstance(name, str) and name.strip().lower() in THEMES:
+        _current_theme = name.strip().lower()
+    return _current_theme
+
+
+def system_theme() -> str:
+    """读取系统"应用模式"设置，返回 "light" / "dark"；读取失败默认深色。
+
+    只读注册表 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize
+    的 AppsUseLightTheme（1 = 浅色，0 = 深色）。winreg 延迟导入，非 Windows 直接回退。
+    """
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        try:
+            value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        finally:
+            winreg.CloseKey(key)
+        return "light" if int(value) == 1 else "dark"
+    except Exception:
+        return DEFAULT_THEME
+
+
+def repolish(widget) -> None:
+    """动态属性改变后重新计算样式（含子控件），使属性选择器立即生效。"""
+    try:
+        targets = [widget]
+        try:
+            targets.extend(widget.findChildren(QWidget))
+        except Exception:
+            pass
+        for w in targets:
+            st = w.style()
+            if st is None:
+                continue
+            st.unpolish(w)
+            st.polish(w)
+        widget.update()
+    except Exception:
+        pass
+
+
+# 样式表模板：用 $token 占位，避免 Qt 的 {} 与 f-string 冲突
+_QSS_TEMPLATE = """
+* { font-family: "$font_main"; font-size: 13px; color: $fg; }
+QMainWindow, QDialog, QWidget { background-color: $canvas; }
+QLabel { background: transparent; }
+
+/* ── 卡片 / 分隔线 ── */
+QFrame#Card {
+    background-color: $canvas_subtle;
+    border: 1px solid $border;
+    border-radius: 8px;
+}
+QFrame#HeaderSep {
+    background-color: $border_muted;
+    border: none;
+    min-height: 1px;
+    max-height: 1px;
+}
+QWidget#TaskContainer { background: transparent; }
+
+/* ── 文本角色 ── */
+QLabel[role="title"] { font-size: 20px; font-weight: 600; color: $fg; }
+QLabel[role="subtitle"] { font-size: 12px; color: $fg_muted; }
+QLabel[role="muted"] { color: $fg_muted; }
+QLabel[role="subtle"] { color: $fg_subtle; font-size: 11px; }
+QLabel[role="hint"] { color: $fg_muted; font-size: 11px; }
+QLabel[role="cardTitle"] { font-size: 14px; font-weight: 600; color: $fg; }
+QLabel[role="accent"] { color: $accent; }
+QLabel[role="key"] { color: $accent; font-family: "$font_mono"; font-size: 12px; }
+QLabel[role="tagClick"] { color: $success; font-weight: 600; }
+QLabel[role="tagTimer"] { color: $attention; font-weight: 600; }
+QLabel[role="window"] { color: $fg_muted; font-size: 11px; }
+QLabel[role="warn"] { color: $attention; font-size: 11px; }
+QLabel[role="status"] { color: $fg_subtle; }
+QLabel[role="progress"] { color: $fg_subtle; font-family: "$font_mono"; }
+QLabel[role="capture"] {
+    background-color: $canvas_inset; color: $accent; border: 1px solid $border;
+    border-radius: 6px; font-family: "$font_mono"; font-size: 16px; padding: 6px;
+}
+QLabel[role="seqbox"] {
+    background-color: $canvas_inset; color: $done; border: 1px solid $border;
+    border-radius: 6px; font-family: "$font_mono"; font-size: 12px; padding: 10px 12px;
+}
+
+/* ── 任务行：状态由动态属性 state 驱动 ── */
+QFrame#TaskRow {
+    background-color: $canvas_subtle;
+    border: 1px solid $border_muted;
+    border-radius: 6px;
+}
+QFrame#TaskRow[state="running"] { border-color: $success_emphasis; }
+QFrame#TaskRow[state="paused"] { border-color: $attention; }
+QFrame#TaskRow[state="blocked"] { border-color: $attention; }
+QFrame#TaskRow[state="running"] QLabel[role="status"] { color: $success; }
+QFrame#TaskRow[state="paused"] QLabel[role="status"] { color: $attention; }
+QFrame#TaskRow[state="blocked"] QLabel[role="status"] { color: $attention; }
+QFrame#TaskRow[state="running"] QLabel[role="progress"] { color: $fg; }
+QFrame#TaskRow[state="blocked"] QLabel[role="progress"] { color: $attention; }
+
+/* ── 输入控件 ── */
+QLineEdit {
+    background-color: $canvas; color: $fg; border: 1px solid $border;
+    border-radius: 6px; padding: 5px 8px;
+    selection-background-color: $accent; selection-color: $on_emphasis;
+}
+QLineEdit:focus { border: 1px solid $accent; }
+QLineEdit:disabled { background-color: $canvas_subtle; color: $fg_subtle; }
+QComboBox {
+    background-color: $canvas; color: $fg; border: 1px solid $border;
+    border-radius: 6px; padding: 5px 8px;
+}
+QComboBox:focus, QComboBox:on { border: 1px solid $accent; }
+QComboBox::drop-down { border: none; width: 20px; }
+QComboBox QAbstractItemView {
+    background-color: $canvas; color: $fg; border: 1px solid $border;
+    border-radius: 6px; padding: 4px; outline: none;
+    selection-background-color: $accent; selection-color: $on_emphasis;
+}
+
+/* ── 按钮 ── */
+QPushButton {
+    background-color: $btn_bg; color: $btn_fg; border: 1px solid $border;
+    border-radius: 6px; padding: 5px 12px; font-weight: 600;
+}
+QPushButton:hover { background-color: $btn_hover; }
+QPushButton:pressed { background-color: $btn_active; }
+QPushButton:disabled { color: $fg_subtle; border-color: $border_muted; }
+QPushButton#Primary, QPushButton#Success {
+    background-color: $success_emphasis; color: $on_emphasis;
+    border: 1px solid $success_emphasis;
+}
+QPushButton#Primary:hover, QPushButton#Success:hover {
+    background-color: $success; border-color: $success;
+}
+QPushButton#Primary:pressed, QPushButton#Success:pressed {
+    background-color: $success_emphasis; border-color: $success_emphasis;
+}
+QPushButton#Danger {
+    background-color: $danger_emphasis; color: $on_emphasis;
+    border: 1px solid $danger_emphasis;
+}
+QPushButton#Danger:hover { background-color: $danger; border-color: $danger; }
+QPushButton#Warn {
+    background-color: $attention; color: $on_emphasis; border: 1px solid $attention;
+}
+QPushButton#Warn:hover { border-color: $fg; }
+QPushButton#Primary:disabled, QPushButton#Success:disabled,
+QPushButton#Danger:disabled, QPushButton#Warn:disabled {
+    background-color: $btn_bg; color: $fg_subtle; border-color: $border_muted;
+}
+QPushButton#Ghost {
+    background-color: transparent; color: $fg_muted; border: 1px solid $border;
+}
+QPushButton#Ghost:hover { background-color: $btn_hover; color: $fg; }
+QPushButton#Icon, QPushButton#IconDanger {
+    background: transparent; border: 1px solid transparent; border-radius: 6px;
+    padding: 2px 8px; font-size: 14px; font-weight: 400; color: $fg_muted;
+}
+QPushButton#Icon:hover { background-color: $btn_hover; color: $accent; }
+QPushButton#IconDanger:hover { background-color: $btn_hover; color: $danger; }
+QPushButton#SeqBtn {
+    font-family: "$font_mono"; font-size: 12px; text-align: left; padding: 6px 10px;
+}
+QPushButton#SeqBtn[filled="true"] {
+    background-color: $canvas_inset; color: $done; border: 1px solid $border;
+}
+QPushButton#SeqBtn[filled="false"] {
+    background-color: transparent; color: $fg_subtle; border: 1px dashed $border;
+}
+
+/* ── 菜单 ── */
+QMenu {
+    background-color: $canvas; color: $fg; border: 1px solid $border;
+    border-radius: 6px; padding: 4px;
+}
+QMenu::item { padding: 6px 24px 6px 12px; border-radius: 4px; }
+QMenu::item:selected { background-color: $accent; color: $on_emphasis; }
+QMenu::separator { height: 1px; background: $border_muted; margin: 4px 6px; }
+
+/* ── 滚动条 / 状态栏 / 提示 ── */
+QScrollArea { background: transparent; border: none; }
+QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: $border; border-radius: 5px; min-height: 28px; }
+QScrollBar::handle:vertical:hover { background: $fg_subtle; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QStatusBar {
+    background-color: $canvas_subtle; color: $fg_muted;
+    border-top: 1px solid $border_muted;
+}
+QStatusBar::item { border: none; }
+QToolTip {
+    background-color: $tooltip_bg; color: $tooltip_fg;
+    border: 1px solid $border; padding: 4px 6px; border-radius: 4px;
+}
+QDialogButtonBox QPushButton { min-width: 64px; }
+"""
+
+
+def make_qss(theme_name: str | None = None) -> str:
+    """生成样式表。theme_name 省略或非法时使用当前主题。"""
+    tokens = dict(THEMES[normalize_theme(theme_name)])
+    tokens["font_main"] = FONT_MAIN
+    tokens["font_mono"] = FONT_MONO
+    return Template(_QSS_TEMPLATE).substitute(tokens)
+
+
+# ── 配置位置 ──
+def _app_dir() -> str:
+    """程序目录：打包后是 exe 所在目录，否则是脚本所在目录。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _user_config_path() -> str:
+    """默认（非便携）配置路径：%APPDATA%\\KeyClicker\\config.json"""
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "KeyClicker", "config.json")
+
+
+def resolve_config_path(app_dir: str | None = None) -> str:
+    """解析配置文件路径，优先级由高到低：
+
+    1. 环境变量 ``KEYCLICKER_CONFIG``（非空）
+    2. 程序目录下**已存在**的 ``clicker_config.json``（兼容旧版便携用法）
+    3. 程序目录下存在 ``portable.flag`` → 程序目录下 ``clicker_config.json``
+    4. 否则 ``%APPDATA%\\KeyClicker\\config.json``
+
+    这里只解析路径、不创建任何目录/文件（保持无副作用，方便测试与查询）；
+    目录在真正写入配置时由 :func:`ensure_config_dir` 创建。
+    """
+    env = (os.environ.get("KEYCLICKER_CONFIG") or "").strip()
+    if env:
+        return env
+    base = app_dir or _app_dir()
+    portable = os.path.join(base, "clicker_config.json")
+    if os.path.exists(portable):
+        return portable
+    if os.path.exists(os.path.join(base, "portable.flag")):
+        return portable
+    return _user_config_path()
+
+
+def ensure_config_dir(path: str | None = None) -> str:
+    """确保配置文件所在目录存在，返回该目录；任何失败都静默忽略。"""
+    target = path or CONFIG_PATH
+    d = os.path.dirname(os.path.abspath(target))
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+# 模块级配置路径：测试会直接替换这个变量
+CONFIG_PATH = resolve_config_path()
 
 # ── 按键名规范化 ──
 # keyboard 库有自己的一套规范名（ctrl / windows / page up / caps lock…），
@@ -179,6 +509,93 @@ def send_keys(keys: list[str], hold_ms: int = 20) -> bool:
 
 
 # ══════════════════════════════════════════════════════════
+#  前台窗口标题匹配
+# ══════════════════════════════════════════════════════════
+# 窗口匹配模式：包含 / 精确 / 正则
+WINDOW_MODES = ("contains", "exact", "regex")
+WINDOW_MODE_LABELS = {"contains": "包含", "exact": "精确", "regex": "正则"}
+
+
+def foreground_window_title() -> str:
+    """当前前台窗口标题；失败或非 Windows 返回空串。
+
+    每次只做一次轻量 Win32 调用，不起线程、不做缓存。
+    """
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        length = int(user32.GetWindowTextLengthW(hwnd))
+        if length <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        return buf.value or ""
+    except Exception:
+        return ""
+
+
+def foreground_process_name() -> str:
+    """前台窗口所属进程的可执行文件名（仅用于界面提示）；失败返回空串。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return ""
+        process_query_limited_information = 0x1000
+        handle = kernel32.OpenProcess(
+            process_query_limited_information, False, pid.value)
+        if not handle:
+            return ""
+        try:
+            size = wintypes.DWORD(1024)
+            buf = ctypes.create_unicode_buffer(size.value)
+            ok = kernel32.QueryFullProcessImageNameW(
+                handle, 0, buf, ctypes.byref(size))
+            if not ok:
+                return ""
+            return os.path.basename(buf.value or "")
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return ""
+
+
+def match_window(pattern: str, title: str, mode: str = "contains") -> bool:
+    """纯函数：判断窗口标题是否命中匹配条件。
+
+    · ``pattern`` 为空 → 恒为 True（即不限制窗口）
+    · ``contains`` / ``exact`` 大小写不敏感
+    · ``regex`` 使用 ``re.search``；非法正则返回 False 且不抛异常
+    · 未知 mode 按 ``contains`` 处理
+    """
+    pat = (pattern or "").strip()
+    if not pat:
+        return True
+    text = title or ""
+    how = (mode or "contains").strip().lower()
+    try:
+        if how == "exact":
+            return text.strip().lower() == pat.lower()
+        if how == "regex":
+            return re.search(pat, text, re.IGNORECASE) is not None
+        return pat.lower() in text.lower()
+    except re.error:
+        return False          # 正则写错 → 视为不匹配，绝不抛出
+    except Exception:
+        return False
+
+
+# ══════════════════════════════════════════════════════════
 #  任务模型（后台线程）
 # ══════════════════════════════════════════════════════════
 class _BaseTask:
@@ -186,6 +603,7 @@ class _BaseTask:
         self._stop = threading.Event()
         self._pause = threading.Event()
         self._thread: threading.Thread | None = None
+        self._window_blocked = False
 
     @property
     def running(self) -> bool:
@@ -195,12 +613,18 @@ class _BaseTask:
     def paused(self) -> bool:
         return self._pause.is_set()
 
+    @property
+    def window_blocked(self) -> bool:
+        """只读：当前是否因为前台窗口不匹配而停止发送按键。"""
+        return bool(getattr(self, "_window_blocked", False))
+
     def stop(self):
         self._stop.set()
         self._pause.clear()
         if self._thread:
             self._thread.join(timeout=0.8)
         self._thread = None
+        self._window_blocked = False
 
     def toggle_pause(self):
         if self._pause.is_set():
@@ -208,10 +632,22 @@ class _BaseTask:
         else:
             self._pause.set()
 
+    def _window_allows(self) -> bool:
+        """前台窗口是否满足本任务的窗口匹配条件。
+
+        未设置匹配条件时直接返回 True，连 Win32 调用都省掉。
+        """
+        pattern = getattr(self, "window_match", "") or ""
+        if not pattern.strip():
+            return True
+        return match_window(pattern, foreground_window_title(),
+                            getattr(self, "window_mode", "contains"))
+
     def _launch(self, target):
         # 每次启动使用全新的事件对象，避免旧线程未退出时被"复活"
         self._stop = threading.Event()
         self._pause = threading.Event()
+        self._window_blocked = False
         self._thread = threading.Thread(target=target, daemon=True)
         self._thread.start()
 
@@ -223,11 +659,20 @@ class ClickTask(_BaseTask):
     keys: str = "a"
     interval_ms: int = 100
     click_count: int = 0
+    # ── v1.2.0 新增（追加在末尾，保持原有位置参数顺序不变）──
+    window_match: str = ""
+    window_mode: str = "contains"
 
     def __post_init__(self):
         _BaseTask.__init__(self)
         self.keys = "+".join(parse_keys(self.keys)) or "a"
         self.interval_ms = max(int(self.interval_ms), MIN_INTERVAL_MS)
+        self._norm_window()
+
+    def _norm_window(self):
+        self.window_match = str(self.window_match or "").strip()
+        mode = str(self.window_mode or "contains").strip().lower()
+        self.window_mode = mode if mode in WINDOW_MODES else "contains"
 
     def start(self):
         if self.running:
@@ -243,8 +688,13 @@ class ClickTask(_BaseTask):
                 self._stop.wait(0.05)
                 next_t = time.monotonic()  # 暂停恢复后重新对齐节拍
                 continue
-            send_keys(kp)
-            self.click_count += 1
+            if self._window_allows():
+                self._window_blocked = False
+                send_keys(kp)
+                self.click_count += 1
+            else:
+                # 前台窗口不匹配：按节拍继续循环，但一个键都不发、不计数
+                self._window_blocked = True
             # 按固定节拍推进，避免每次发送的耗时累积成漂移
             next_t += self.interval_ms / 1000.0
             delay = next_t - time.monotonic()
@@ -254,11 +704,14 @@ class ClickTask(_BaseTask):
             self._stop.wait(delay)
 
     def to_dict(self):
-        return {"type": "click", "keys": self.keys, "interval": self.interval_ms}
+        return {"type": "click", "keys": self.keys, "interval": self.interval_ms,
+                "window_match": self.window_match, "window_mode": self.window_mode}
 
     @classmethod
     def from_dict(cls, d):
-        return cls(d.get("keys", "a"), int(d.get("interval", 100)))
+        return cls(d.get("keys", "a"), int(d.get("interval", 100)),
+                   window_match=d.get("window_match", ""),
+                   window_mode=d.get("window_mode", "contains"))
 
 
 @dataclass
@@ -271,6 +724,9 @@ class TimerTask(_BaseTask):
     gap_ms: int = 200
     remaining: int = 0
     fire_count: int = 0
+    # ── v1.2.0 新增（追加在末尾，保持原有位置参数顺序不变）──
+    window_match: str = ""
+    window_mode: str = "contains"
 
     def __post_init__(self):
         _BaseTask.__init__(self)
@@ -282,6 +738,9 @@ class TimerTask(_BaseTask):
         if self.total_sec < 1:
             self.total_sec = 1
         self.remaining = self.total_sec if self.remaining <= 0 else int(self.remaining)
+        self.window_match = str(self.window_match or "").strip()
+        mode = str(self.window_mode or "contains").strip().lower()
+        self.window_mode = mode if mode in WINDOW_MODES else "contains"
 
     def start(self):
         if self.running:
@@ -316,9 +775,14 @@ class TimerTask(_BaseTask):
                 if next_tick < now:  # 落后过多（休眠/卡顿）时重新对齐
                     next_tick = now + 1.0
                 if self.remaining <= 0:
-                    self._fire()
+                    # 倒计时照常走；到点若前台窗口不匹配则不触发、不计次数
+                    allowed = self._window_allows()
+                    self._window_blocked = not allowed
+                    if allowed:
+                        self._fire()
                     if not self._stop.is_set():
-                        self.fire_count += 1
+                        if allowed:
+                            self.fire_count += 1
                         self.remaining = self.total_sec
                         next_tick = time.monotonic() + 1.0
             else:
@@ -326,12 +790,15 @@ class TimerTask(_BaseTask):
 
     def to_dict(self):
         return {"type": "timer", "seq": list(self.seq),
-                "minutes": self.minutes, "seconds": self.seconds, "gap": self.gap_ms}
+                "minutes": self.minutes, "seconds": self.seconds, "gap": self.gap_ms,
+                "window_match": self.window_match, "window_mode": self.window_mode}
 
     @classmethod
     def from_dict(cls, d):
         return cls(list(d.get("seq", ["a"])), int(d.get("minutes", 0)),
-                   int(d.get("seconds", 10)), int(d.get("gap", 200)))
+                   int(d.get("seconds", 10)), int(d.get("gap", 200)),
+                   window_match=d.get("window_match", ""),
+                   window_mode=d.get("window_mode", "contains"))
 
 
 @dataclass
@@ -357,108 +824,13 @@ class Page:
 
 
 # ══════════════════════════════════════════════════════════
-#  全局样式表
-# ══════════════════════════════════════════════════════════
-def make_qss() -> str:
-    return f"""
-    * {{ font-family: "{FONT_MAIN}"; font-size: 13px; color: {FG}; }}
-    QMainWindow, QDialog, QWidget {{ background-color: {BG}; }}
-    QLabel {{ background: transparent; }}
-    #Card {{
-        background-color: {BG_CARD};
-        border: 1px solid {BORDER};
-        border-radius: 10px;
-    }}
-    #Title {{ font-size: 22px; font-weight: bold; color: {ACCENT}; }}
-    #Sub   {{ font-size: 12px; color: {FG_DIM}; }}
-    #CardTitle {{ font-size: 15px; font-weight: bold; }}
-    QLineEdit {{
-        background-color: {BG_ENTRY};
-        color: {FG};
-        border: 1px solid {BORDER};
-        border-radius: 6px;
-        padding: 6px 9px;
-        selection-background-color: {ACCENT};
-        selection-color: #11111b;
-    }}
-    QLineEdit:focus {{ border: 1px solid {ACCENT}; }}
-    QPushButton {{
-        background-color: {BG_CARD};
-        color: {FG};
-        border: 1px solid {BORDER};
-        border-radius: 8px;
-        padding: 7px 14px;
-    }}
-    QPushButton:hover {{ border-color: {ACCENT}; background-color: {BG_HOVER}; }}
-    QPushButton:pressed {{ background-color: #444a6a; }}
-    QPushButton:disabled {{ color: {FG_DIM}; border-color: {BORDER}; background-color: {BG_ENTRY}; }}
-    QPushButton#Primary {{
-        background-color: {ACCENT}; color: #11111b; border: none; font-weight: bold;
-    }}
-    QPushButton#Primary:hover {{ background-color: #a0c0ff; }}
-    QPushButton#Success {{
-        background-color: {GREEN}; color: #11111b; border: none; font-weight: bold;
-    }}
-    QPushButton#Success:hover {{ background-color: #c0efbc; }}
-    QPushButton#Danger {{
-        background-color: {RED}; color: #11111b; border: none; font-weight: bold;
-    }}
-    QPushButton#Danger:hover {{ background-color: #f5a0ba; }}
-    QPushButton#Warn {{
-        background-color: {ORANGE}; color: #11111b; border: none; font-weight: bold;
-    }}
-    QPushButton#Warn:hover {{ background-color: #ffc49a; }}
-    QPushButton#Ghost {{
-        background-color: transparent; color: {FG_DIM}; border: 1px solid {BORDER};
-    }}
-    QPushButton#Ghost:hover {{ color: {FG}; border-color: {ACCENT}; }}
-    QPushButton#Icon {{
-        background: transparent; border: none; color: {FG_DIM};
-        font-size: 15px; padding: 2px 8px;
-    }}
-    QPushButton#Icon:hover {{ color: {ACCENT}; }}
-    QPushButton#IconDanger {{
-        background: transparent; border: none; color: {FG_DIM};
-        font-size: 15px; padding: 2px 8px;
-    }}
-    QPushButton#IconDanger:hover {{ color: {RED}; background: transparent; }}
-    QPushButton#IconWarn {{
-        background: transparent; border: none; color: {FG_DIM};
-        font-size: 15px; padding: 2px 8px;
-    }}
-    QPushButton#IconWarn:hover {{ color: {ORANGE}; background: transparent; }}
-    QComboBox {{
-        background-color: {BG_ENTRY}; border: 1px solid {BORDER};
-        border-radius: 6px; padding: 5px 10px;
-    }}
-    QComboBox::drop-down {{ border: none; width: 22px; }}
-    QComboBox QAbstractItemView {{
-        background-color: {BG_ENTRY}; border: 1px solid {BORDER};
-        selection-background-color: {ACCENT}; selection-color: #11111b; outline: none;
-    }}
-    QScrollArea {{ background: transparent; border: none; }}
-    QScrollBar:vertical {{ background: transparent; width: 10px; }}
-    QScrollBar::handle:vertical {{
-        background: {BORDER}; border-radius: 4px; min-height: 28px;
-    }}
-    QScrollBar::handle:vertical:hover {{ background: {ACCENT}; }}
-    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-    QStatusBar {{ background: {BG}; color: {FG_DIM}; }}
-    QToolTip {{
-        background-color: {BG_ENTRY}; color: {FG};
-        border: 1px solid {BORDER}; padding: 4px;
-    }}
-    QDialogButtonBox QPushButton {{ min-width: 64px; }}
-    """
-
-
-# ══════════════════════════════════════════════════════════
 #  小部件
 # ══════════════════════════════════════════════════════════
-def _label(text: str, style: str = "", fixed_w: int | None = None) -> QLabel:
+def _label(text: str = "", role: str = "", fixed_w: int | None = None) -> QLabel:
+    """建一个标签并挂上 role 动态属性（颜色等一律交给样式表）。"""
     lb = QLabel(text)
-    if style:
-        lb.setStyleSheet(style)
+    if role:
+        lb.setProperty("role", role)
     if fixed_w:
         lb.setFixedWidth(fixed_w)
     return lb
@@ -554,6 +926,7 @@ class KeyCaptureDialog(QDialog):
     """单键/组合键录入对话框：按下想用的按键即完成录入，Esc 取消。
 
     用于连点模式的按键录入；钩子不可用时提示手动输入。
+    样式表由 QApplication 统一提供，这里不再单独设置。
     """
 
     def __init__(self, parent=None, current: str = ""):
@@ -561,7 +934,6 @@ class KeyCaptureDialog(QDialog):
         self.setWindowTitle("按键录入")
         self.setModal(True)
         self.setMinimumWidth(400)
-        self.setStyleSheet(make_qss())
         self._value = (current or "").strip()
         self.recorder = KeyRecorder(self)
         self.recorder.captured.connect(self._on_captured)
@@ -575,15 +947,12 @@ class KeyCaptureDialog(QDialog):
         outer.setSpacing(10)
         outer.addWidget(_label(
             "请按下要使用的按键；可同时按住 Ctrl / Shift / Alt / Win 组成组合键。",
-            f"color:{FG_DIM}; font-size:12px;"))
-        self.value_lb = _label(
-            self._value or "（等待按键…）",
-            f"background:{BG_ENTRY}; color:{ACCENT}; border:1px solid {BORDER};"
-            f"border-radius:6px; font-family:{FONT_MONO}; font-size:16px;")
+            "hint"))
+        self.value_lb = _label(self._value or "（等待按键…）", "capture")
         self.value_lb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.value_lb.setMinimumHeight(52)
         outer.addWidget(self.value_lb)
-        self.hint_lb = _label("", f"color:{FG_DIM}; font-size:11px;")
+        self.hint_lb = _label("", "hint")
         self.hint_lb.setWordWrap(True)
         outer.addWidget(self.hint_lb)
 
@@ -652,7 +1021,12 @@ class _MainBridge(QObject):
 
 
 class TaskRow(QFrame):
-    """单条任务行"""
+    """单条任务行
+
+    行的外观状态挂在动态属性 ``state`` 上（stopped / running / paused / blocked），
+    由样式表按属性选择器上色；刷新时值没变就不重复 setText/setProperty，
+    避免 250ms 轮询白白触发重绘。
+    """
     playReq = pyqtSignal(object)
     stopReq = pyqtSignal(object)
     delReq  = pyqtSignal(object)
@@ -660,42 +1034,45 @@ class TaskRow(QFrame):
     def __init__(self, task, parent=None):
         super().__init__(parent)
         self.task = task
-        self.setObjectName("Card")
-        self.setFixedHeight(52)
+        self.setObjectName("TaskRow")
+        self.setFixedHeight(62)
+        self._state = ""
         self._build()
+        self.refresh()
 
     def _build(self):
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 5, 12, 5)
+        lay.setContentsMargins(12, 6, 12, 6)
         lay.setSpacing(8)
 
         if isinstance(self.task, ClickTask):
-            tag, tag_c = "连点", GREEN
+            tag, tag_role = "连点", "tagClick"
         else:
-            tag, tag_c = "定时", ORANGE
-        lay.addWidget(_label(tag, f"color:{tag_c}; font-weight:bold;", 38))
+            tag, tag_role = "定时", "tagTimer"
+        lay.addWidget(_label(tag, tag_role, 40))
 
         if isinstance(self.task, ClickTask):
             key_text = self.task.keys
             info_text = f"间隔 {self.task.interval_ms} ms"
-            self.prog_lb = _label("0", f"color:{FG_DIM}; font-family:{FONT_MONO};", 52)
         else:
             key_text = "   ·   ".join(self.task.seq) or "(空)"
             m, s = divmod(self.task.total_sec, 60)
             info_text = f"{m:02d}:{s:02d}  间隔 {self.task.gap_ms} ms"
-            self.prog_lb = _label(f"{m:02d}:{s:02d}",
-                                  f"color:{FG_DIM}; font-family:{FONT_MONO};", 52)
 
         left = QVBoxLayout()
         left.setSpacing(0)
-        self.key_lb = _label(key_text, f"color:{ACCENT}; font-family:{FONT_MONO}; font-size:12px;")
-        self.info_lb = _label(info_text, f"color:{FG_DIM}; font-size:11px;")
+        self.key_lb = _label(key_text, "key")
+        self.info_lb = _label(info_text, "subtle")
+        self.window_lb = _label("", "window")
+        self.window_lb.setVisible(False)
         left.addWidget(self.key_lb)
         left.addWidget(self.info_lb)
+        left.addWidget(self.window_lb)
         lay.addLayout(left, 1)
 
-        self.status_lb = _label("○ 停止", f"color:{FG_DIM};", 52)
+        self.status_lb = _label("○ 停止", "status", 62)
         lay.addWidget(self.status_lb)
+        self.prog_lb = _label("", "progress", 54)
         lay.addWidget(self.prog_lb)
 
         self.btn_play = QPushButton("▶")
@@ -714,38 +1091,64 @@ class TaskRow(QFrame):
         lay.addWidget(self.btn_stop)
         lay.addWidget(self.btn_del)
 
+    # ── 只改"变了"的属性，省掉无意义的重绘 ──
+    @staticmethod
+    def _set_text(lb, text: str):
+        if lb.text() != text:
+            lb.setText(text)
+
+    @staticmethod
+    def _set_role(lb, role: str):
+        if lb.property("role") != role:
+            lb.setProperty("role", role)
+            repolish(lb)
+
+    def _set_state(self, state: str):
+        if self._state != state:
+            self._state = state
+            self.setProperty("state", state)
+            repolish(self)
+
     def refresh(self):
         t = self.task
         running, paused = t.running, t.paused
-        if running and not paused:
-            self.status_lb.setText("● 运行")
-            self.status_lb.setStyleSheet(f"color:{GREEN};")
-            self.btn_play.setVisible(True)
-            self.btn_stop.setVisible(True)
+        blocked = bool(running and not paused and t.window_blocked)
+        if blocked:
+            state, status = "blocked", "● 运行"
+        elif running and not paused:
+            state, status = "running", "● 运行"
         elif paused:
-            self.status_lb.setText("● 暂停")
-            self.status_lb.setStyleSheet(f"color:{ORANGE};")
-            self.btn_play.setVisible(True)
-            self.btn_stop.setVisible(True)
+            state, status = "paused", "● 暂停"
         else:
-            self.status_lb.setText("○ 停止")
-            self.status_lb.setStyleSheet(f"color:{FG_DIM};")
-            self.btn_play.setVisible(True)
-            self.btn_stop.setVisible(False)
+            state, status = "stopped", "○ 停止"
+        self._set_state(state)
+        self._set_text(self.status_lb, status)
 
         if isinstance(t, ClickTask):
-            self.prog_lb.setText(str(t.click_count))
-            self.prog_lb.setStyleSheet(
-                f"color:{YELLOW}; font-family:{FONT_MONO};"
-                if running and not paused
-                else f"color:{FG_DIM}; font-family:{FONT_MONO};")
+            self._set_text(self.prog_lb, str(t.click_count))
         else:
             m, s = divmod(max(t.remaining, 0), 60)
-            self.prog_lb.setText(f"{m:02d}:{s:02d}")
-            self.prog_lb.setStyleSheet(
-                f"color:{GREEN}; font-family:{FONT_MONO};"
-                if running and not paused
-                else f"color:{FG_DIM}; font-family:{FONT_MONO};")
+            self._set_text(self.prog_lb, f"{m:02d}:{s:02d}")
+
+        pattern = (t.window_match or "").strip()
+        if not pattern:
+            if not self.window_lb.isHidden():
+                self.window_lb.setVisible(False)
+        else:
+            if blocked:
+                self._set_text(self.window_lb, "窗口不匹配（当前前台窗口未命中）")
+                self._set_role(self.window_lb, "warn")
+            else:
+                label = WINDOW_MODE_LABELS.get(t.window_mode, "包含")
+                self._set_text(self.window_lb, f"窗口{label}：{pattern}")
+                self._set_role(self.window_lb, "window")
+            if self.window_lb.isHidden():
+                self.window_lb.setVisible(True)
+
+        # isHidden() 反映"是否被显式隐藏"，父窗口尚未显示时依然准确
+        show_stop = bool(running or paused)
+        if show_stop == self.btn_stop.isHidden():
+            self.btn_stop.setVisible(show_stop)
 
     def is_running(self):
         return self.task.running or self.task.paused
@@ -759,7 +1162,6 @@ class SequenceEditor(QDialog):
         self.setWindowTitle("按键序列")
         self.setModal(True)
         self.setMinimumWidth(460)
-        self.setStyleSheet(make_qss())
         self._seq = [format_keys(parse_keys(str(s))) or str(s) for s in (existing or [])]
         self._recording = False
         self.recorder = KeyRecorder(self)
@@ -773,11 +1175,9 @@ class SequenceEditor(QDialog):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(18, 16, 18, 16)
         outer.setSpacing(10)
-        outer.addWidget(_label("按键序列（录制时按 Esc 结束）：", f"color:{FG_DIM}; font-size:12px;"))
+        outer.addWidget(_label("按键序列（录制时按 Esc 结束）：", "hint"))
 
-        self.seq_lb = _label("", f"background:{BG_ENTRY}; color:{PURPLE}; padding:10px 12px;"
-                              f"border:1px solid {BORDER}; border-radius:6px;"
-                              f"font-family:{FONT_MONO}; font-size:12px;")
+        self.seq_lb = _label("", "seqbox")
         self.seq_lb.setMinimumHeight(46)
         self.seq_lb.setWordWrap(True)
         outer.addWidget(self.seq_lb)
@@ -788,7 +1188,7 @@ class SequenceEditor(QDialog):
         outer.addWidget(self.rec_btn)
 
         outer.addWidget(_label("或手动输入（逗号分隔，支持组合键 如  ctrl+shift+f5）：",
-                               f"color:{FG_DIM}; font-size:11px;"))
+                               "hint"))
         self.manual_edit = QLineEdit()
         self.manual_edit.setPlaceholderText("例: a, ctrl+f9, space, enter")
         outer.addWidget(self.manual_edit)
@@ -837,7 +1237,7 @@ class SequenceEditor(QDialog):
         self._render()
         self.rec_btn.setText("■ 停止录入")
         self.rec_btn.setObjectName("Danger")
-        self.rec_btn.setStyleSheet(make_qss())
+        repolish(self.rec_btn)
         # 录制期间：按钮/输入框不接收焦点，避免空格/回车误触
         self.rec_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.manual_edit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -877,7 +1277,7 @@ class SequenceEditor(QDialog):
         self.recorder.stop()
         self.rec_btn.setText("● 开始录入")
         self.rec_btn.setObjectName("Warn")
-        self.rec_btn.setStyleSheet(make_qss())
+        repolish(self.rec_btn)
         self.rec_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.manual_edit.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._render()
@@ -929,6 +1329,7 @@ class PagePanel(QWidget):
         self.page = page
         self.rows: list[TaskRow] = []
         self._timer_seq: list = []
+        self._stat_text = ""
         self._build()
         self._rebuild_rows()
         self._refresh_stats()
@@ -1008,13 +1409,34 @@ class PagePanel(QWidget):
         r2 = QHBoxLayout()
         r2.addWidget(_label("按键序列"))
         self.seq_btn = QPushButton("点击设置序列")
-        self.seq_btn.setObjectName("Ghost")
+        self.seq_btn.setObjectName("SeqBtn")
+        self.seq_btn.setProperty("filled", "false")
         self.seq_btn.clicked.connect(self._edit_seq)
         r2.addWidget(self.seq_btn, 1)
         tv.addLayout(r2)
 
         self.timer_grp.hide()
         al.addWidget(self.timer_grp)
+
+        # 前台窗口匹配（连点 / 定时都适用）
+        r3 = QHBoxLayout()
+        r3.setSpacing(8)
+        r3.addWidget(_label("仅在前台窗口匹配时生效"))
+        self.window_edit = QLineEdit("")
+        self.window_edit.setPlaceholderText("留空=不限制；可填窗口标题关键词")
+        r3.addWidget(self.window_edit, 1)
+        self.window_mode_combo = QComboBox()
+        for m in WINDOW_MODES:
+            self.window_mode_combo.addItem(WINDOW_MODE_LABELS[m], m)
+        self.window_mode_combo.setFixedWidth(92)
+        self.window_mode_combo.setToolTip("窗口标题的匹配方式：包含 / 精确 / 正则")
+        r3.addWidget(self.window_mode_combo)
+        self.window_grab_btn = QPushButton("抓取当前窗口")
+        self.window_grab_btn.setObjectName("Ghost")
+        self.window_grab_btn.setToolTip("把当前前台窗口的标题填入左侧输入框")
+        self.window_grab_btn.clicked.connect(self._grab_window)
+        r3.addWidget(self.window_grab_btn)
+        al.addLayout(r3)
 
         add_btn = QPushButton("＋  添加到任务列表")
         add_btn.setObjectName("Primary")
@@ -1029,11 +1451,9 @@ class PagePanel(QWidget):
         ll.setSpacing(6)
 
         head = QHBoxLayout()
-        title = QLabel("任务列表")
-        title.setObjectName("CardTitle")
-        head.addWidget(title)
+        head.addWidget(_label("任务列表", "cardTitle"))
         head.addStretch(1)
-        self.stat_lb = _label("", f"color:{FG_DIM}; font-size:11px;")
+        self.stat_lb = _label("", "subtle")
         head.addWidget(self.stat_lb)
         b_clear = QPushButton("清空")
         b_clear.setObjectName("Ghost")
@@ -1045,11 +1465,11 @@ class PagePanel(QWidget):
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.container = QWidget()
-        self.container.setStyleSheet("background: transparent;")
+        self.container.setObjectName("TaskContainer")
         self.task_layout = QVBoxLayout(self.container)
         self.task_layout.setContentsMargins(0, 0, 4, 0)
         self.task_layout.setSpacing(6)
-        self.empty_lb = _label("暂无任务，请在上方添加", f"color:{FG_DIM};")
+        self.empty_lb = _label("暂无任务，请在上方添加", "muted")
         self.empty_lb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.task_layout.addWidget(self.empty_lb)
         self.task_layout.addStretch(1)
@@ -1060,6 +1480,22 @@ class PagePanel(QWidget):
     def _mode_changed(self, i):
         self.click_grp.setVisible(i == 0)
         self.timer_grp.setVisible(i == 1)
+
+    def _grab_window(self):
+        """把当前前台窗口标题写入输入框，并在状态栏提示窗口所属程序。"""
+        title = foreground_window_title()
+        if not title:
+            QMessageBox.information(self, "提示", "未能读取当前前台窗口标题。")
+            return
+        self.window_edit.setText(title)
+        proc = foreground_process_name()
+        msg = f"已抓取窗口标题：{title}" + (f"（{proc}）" if proc else "")
+        parent = self.window()
+        try:
+            if hasattr(parent, "statusBar"):
+                parent.statusBar().showMessage(msg, 4000)
+        except Exception:
+            pass
 
     def _record_click_key(self):
         """打开按键录入对话框，把录入到的按键填回输入框。"""
@@ -1085,17 +1521,30 @@ class PagePanel(QWidget):
     def _refresh_seq_btn(self):
         if self._timer_seq:
             self.seq_btn.setText("   →   ".join(self._timer_seq))
-            self.seq_btn.setStyleSheet(
-                f"QPushButton {{ background:{BG_ENTRY}; color:{PURPLE};"
-                f"border:1px solid {BORDER}; border-radius:6px; padding:6px 10px;"
-                f"font-family:{FONT_MONO}; font-size:12px; }}")
+            filled = "true"
         else:
             self.seq_btn.setText("点击设置序列")
-            self.seq_btn.setStyleSheet(
-                f"QPushButton {{ background:transparent; color:{FG_DIM};"
-                f"border:1px dashed {BORDER}; border-radius:6px; padding:6px 10px; }}")
+            filled = "false"
+        if self.seq_btn.property("filled") != filled:
+            self.seq_btn.setProperty("filled", filled)
+            repolish(self.seq_btn)
+
+    def _window_settings(self) -> tuple[str, str]:
+        """读取界面上当前的窗口匹配设置。"""
+        pattern = self.window_edit.text().strip()
+        idx = self.window_mode_combo.currentIndex()
+        mode = WINDOW_MODES[idx] if 0 <= idx < len(WINDOW_MODES) else "contains"
+        return pattern, mode
 
     def _add_task(self):
+        pattern, mode = self._window_settings()
+        if pattern and mode == "regex":
+            try:
+                re.compile(pattern)
+            except re.error:
+                QMessageBox.warning(self, "正则表达式无效",
+                                    "窗口标题的正则表达式无法编译，请检查后重试。")
+                return
         if self.mode_combo.currentIndex() == 0:
             keys, err = validate_keys(self.click_key.text())
             if err:
@@ -1108,7 +1557,7 @@ class PagePanel(QWidget):
                 return
             key_text = format_keys(keys) or self.click_key.text().strip()
             self.click_key.setText(key_text)
-            task = ClickTask(key_text, ms)
+            task = ClickTask(key_text, ms, window_match=pattern, window_mode=mode)
         else:
             if not self._timer_seq:
                 QMessageBox.warning(self, "提示", "请先设置按键序列")
@@ -1126,7 +1575,8 @@ class PagePanel(QWidget):
             if m == 0 and s == 0:
                 QMessageBox.warning(self, "提示", "倒计时不能为 0")
                 return
-            task = TimerTask(list(self._timer_seq), m, s, gap)
+            task = TimerTask(list(self._timer_seq), m, s, gap,
+                             window_match=pattern, window_mode=mode)
         self.page.tasks.append(task)
         self._rebuild_rows()
         self.dataChanged.emit()
@@ -1188,7 +1638,10 @@ class PagePanel(QWidget):
     def _refresh_stats(self):
         n = len(self.page.tasks)
         run = sum(1 for t in self.page.tasks if t.running)
-        self.stat_lb.setText(f"{n} 个任务  ·  {run} 运行中")
+        text = f"{n} 个任务  ·  {run} 运行中"
+        if text != self._stat_text:
+            self._stat_text = text
+            self.stat_lb.setText(text)
 
     def page_name(self):
         return self.page.name
@@ -1205,12 +1658,16 @@ class MainWindow(QMainWindow):
         self.resize(880, 660)
         self.pages: list[Page] = []
         self.panels: list[PagePanel] = []
-        self.setStyleSheet(make_qss())
+        self.theme_name = DEFAULT_THEME
+        self._cfg_theme: str | None = None
         self._build()
         self._load_config()
+        # 配置里没有主题时跟随系统（首次运行）
+        self.set_theme(self._cfg_theme or system_theme(), apply=False)
         if not self.pages:
             self.pages = [Page("配置1")]
         self._rebuild_stack()
+        ensure_config_dir(CONFIG_PATH)
         self.poller = QTimer(self)
         self.poller.timeout.connect(self._poll)
         self.poller.start(250)
@@ -1231,20 +1688,33 @@ class MainWindow(QMainWindow):
         # 标题栏
         head = QWidget()
         hl = QHBoxLayout(head)
-        hl.setContentsMargins(20, 12, 20, 4)
-        title = QLabel(APP_NAME)
-        title.setObjectName("Title")
-        hl.addWidget(title)
-        hl.addWidget(_label("   连点 · 定时序列 · 多配置页", f"color:{FG_DIM}; font-size:12px;"))
+        hl.setContentsMargins(20, 12, 20, 10)
+        hl.setSpacing(10)
+        hl.addWidget(_label(APP_NAME, "title"))
+        hl.addWidget(_label("连点 · 定时序列 · 多配置页 · 窗口锁定", "subtitle"))
         hl.addStretch(1)
+        self.btn_options = QPushButton("选项")
+        self.btn_options.setObjectName("Ghost")
+        self._build_options_menu()
+        hl.addWidget(self.btn_options)
+        self.btn_theme = QPushButton("")
+        self.btn_theme.setObjectName("Ghost")
+        self.btn_theme.setToolTip("在浅色 / 深色主题之间切换（会自动记住）")
+        self.btn_theme.clicked.connect(self._toggle_theme)
+        hl.addWidget(self.btn_theme)
         root.addWidget(head)
+
+        sep = QFrame()
+        sep.setObjectName("HeaderSep")
+        sep.setFixedHeight(1)
+        root.addWidget(sep)
 
         # 操作栏
         bar = QWidget()
         bl = QHBoxLayout(bar)
-        bl.setContentsMargins(20, 6, 20, 10)
+        bl.setContentsMargins(20, 10, 20, 10)
         bl.setSpacing(8)
-        bl.addWidget(_label("当前页"))
+        bl.addWidget(_label("当前页", "muted"))
 
         self.page_combo = QComboBox()
         self.page_combo.setFixedWidth(140)
@@ -1259,7 +1729,7 @@ class MainWindow(QMainWindow):
         b_rename.setObjectName("Ghost")
         b_rename.clicked.connect(self._rename_page)
         bl.addWidget(b_rename)
-        b_del = QPushButton("🗑 删除页")
+        b_del = QPushButton("✕ 删除页")
         b_del.setObjectName("Ghost")
         b_del.clicked.connect(self._del_page)
         bl.addWidget(b_del)
@@ -1279,9 +1749,18 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         root.addWidget(self.stack, 1)
 
-        self.statusBar()
+        self.statusBar().setSizeGripEnabled(False)
         self.statusBar().showMessage(
             "就绪   ·   热键 Ctrl+` 开始/停止当前页，F6 全部停止   ·   配置自动保存")
+
+    def _build_options_menu(self):
+        menu = QMenu(self)
+        act_dir = menu.addAction("打开配置目录")
+        act_dir.triggered.connect(self._open_config_dir)
+        menu.addSeparator()
+        act_about = menu.addAction("关于")
+        act_about.triggered.connect(self._show_about)
+        self.btn_options.setMenu(menu)
 
     def _center(self):
         scr = QApplication.primaryScreen()
@@ -1289,6 +1768,44 @@ class MainWindow(QMainWindow):
             geo = self.frameGeometry()
             geo.moveCenter(scr.availableGeometry().center())
             self.move(geo.topLeft())
+
+    # ── 主题 ──
+    def _sync_theme_button(self):
+        other = "浅色" if self.theme_name == "dark" else "深色"
+        text = f"切换到{other}"
+        if self.btn_theme.text() != text:
+            self.btn_theme.setText(text)
+
+    def set_theme(self, name: str, apply: bool = True) -> str:
+        """切换主题并同步按钮文字；apply=True 时立刻整窗重新应用样式表。"""
+        self.theme_name = set_current_theme(name)
+        self._sync_theme_button()
+        if apply:
+            app = QApplication.instance()
+            if app is not None:
+                app.setStyleSheet(make_qss(self.theme_name))
+        return self.theme_name
+
+    def _toggle_theme(self):
+        self.set_theme("light" if self.theme_name == "dark" else "dark")
+        self._save()
+
+    # ── 选项菜单 ──
+    def _open_config_dir(self):
+        try:
+            directory = ensure_config_dir(CONFIG_PATH)
+            os.startfile(directory)      # 失败/非 Windows 一律静默
+        except Exception:
+            pass
+
+    def _show_about(self):
+        text = (f"{APP_NAME}  v{__version__}\n\n"
+                f"配置文件：\n{CONFIG_PATH}\n\n"
+                "全局热键：\n"
+                "  Ctrl+`   开始 / 停止当前配置页\n"
+                "  F6       全部停止（紧急停止）\n\n"
+                "纯本地程序，不联网：不采集、不上传任何数据。")
+        QMessageBox.information(self, "关于", text)
 
     def _rebuild_stack(self):
         while self.stack.count():
@@ -1407,7 +1924,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("已全部停止（F6）", 3000)
 
     def _poll(self):
-        # 只刷新当前可见面板，避免后台页白白重绘
+        # 只刷新当前可见面板，避免后台页白白重绘；
+        # 行内刷新只写"变了"的值，值没变不会触发重绘。
         panel = self._current_panel()
         if panel is not None:
             panel._refresh_rows()
@@ -1415,23 +1933,40 @@ class MainWindow(QMainWindow):
 
     def _save(self):
         try:
+            data = {
+                "version": CONFIG_VERSION,
+                "theme": self.theme_name,
+                "pages": [p.to_dict() for p in self.pages],
+            }
+            ensure_config_dir(CONFIG_PATH)
             tmp = CONFIG_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump([p.to_dict() for p in self.pages], f,
-                          ensure_ascii=False, indent=2)
+                json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, CONFIG_PATH)  # 原子替换，避免写一半损坏配置
         except Exception:
             pass
 
     def _load_config(self):
+        """读取配置：兼容 v1.1.0 的旧格式（顶层直接是页面数组）。"""
+        self._cfg_theme = None
         try:
-            if os.path.exists(CONFIG_PATH):
-                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, list):
-                    self.pages = [Page.from_dict(d) for d in data if isinstance(d, dict)]
+            if not os.path.exists(CONFIG_PATH):
+                return
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
         except Exception:
-            pass
+            return
+        if isinstance(data, dict):
+            theme = data.get("theme")
+            if theme in THEMES:
+                self._cfg_theme = theme
+            pages = data.get("pages", [])
+        elif isinstance(data, list):
+            pages = data                      # v1.1.0 旧格式
+        else:
+            pages = []
+        if isinstance(pages, list):
+            self.pages = [Page.from_dict(d) for d in pages if isinstance(d, dict)]
 
     def closeEvent(self, event):
         try:
@@ -1445,15 +1980,34 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def _set_timer_precision(on: bool) -> None:
+    """开启/关闭 1ms 计时精度；非 Windows 或失败一律静默忽略。"""
+    try:
+        import ctypes
+        winmm = ctypes.windll.winmm
+        if on:
+            winmm.timeBeginPeriod(1)
+        else:
+            winmm.timeEndPeriod(1)
+    except Exception:
+        pass
+
+
 def main():
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    _set_timer_precision(True)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
     win = MainWindow()
+    app.setStyleSheet(make_qss())   # 整个应用只在这里应用一次样式表
     win.show()
-    sys.exit(app.exec())
+    try:
+        code = app.exec()
+    finally:
+        _set_timer_precision(False)
+    sys.exit(code)
 
 
 if __name__ == "__main__":

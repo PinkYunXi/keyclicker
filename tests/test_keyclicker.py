@@ -5,11 +5,14 @@
 
 说明：UI 相关测试使用 Qt 的 offscreen 平台插件，不会真的弹出窗口；
      所有测试都不会真正向系统发送按键（使用不存在的键名做空转）。
+     涉及配置路径的用例全部使用临时目录并临时改写环境变量，
+     绝不会读写真实的用户配置目录。
 """
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -71,7 +74,7 @@ class _NoDialog:
 
 
 class _TempConfig:
-    """把配置写到临时文件，避免污染真实 clicker_config.json。"""
+    """把配置写到临时文件，避免污染真实配置文件。"""
 
     def __enter__(self):
         fd, self.path = tempfile.mkstemp(suffix=".json")
@@ -86,6 +89,85 @@ class _TempConfig:
             os.remove(self.path)
         except OSError:
             pass
+        return False
+
+
+class _AppDirStub:
+    """把系统临时目录当作"程序目录"来用。
+
+    受限环境下无法在新建的子目录里写文件，所以这里直接在已存在的临时目录
+    中放置具名标记文件来模拟便携模式，退出时清理干净：
+    全程只使用临时目录，绝不写入真实的用户配置目录。
+    """
+
+    MARKERS = ("clicker_config.json", "portable.flag")
+
+    def __init__(self, *markers: str):
+        self.dir = tempfile.gettempdir()
+        self.want = list(markers)
+
+    def __enter__(self) -> str:
+        self._cleanup()
+        for name in self.want:
+            with open(os.path.join(self.dir, name), "w", encoding="utf-8") as f:
+                f.write("{}")
+        return self.dir
+
+    def __exit__(self, *exc):
+        self._cleanup()
+        return False
+
+    def _cleanup(self) -> None:
+        for name in self.MARKERS:
+            try:
+                os.remove(os.path.join(self.dir, name))
+            except OSError:
+                pass
+
+
+def _fake_appdata() -> str:
+    """假的 %APPDATA% 路径（只用于拼接期望值，不产生任何写入）。"""
+    return os.path.join(tempfile.gettempdir(), "kc_fake_appdata")
+
+
+class _EnvPatch:
+    """临时改写环境变量（值为 None 表示删除该变量）。"""
+
+    def __init__(self, **kw):
+        self.kw = kw
+        self.old: dict = {}
+
+    def __enter__(self):
+        for k, v in self.kw.items():
+            self.old[k] = os.environ.get(k)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self.old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        return False
+
+
+class _StubForeground:
+    """把前台窗口标题打桩成固定值。"""
+
+    def __init__(self, title):
+        self.title = title
+
+    def __enter__(self):
+        self._orig = kc.foreground_window_title
+        kc.foreground_window_title = lambda: self.title
+        return self
+
+    def __exit__(self, *exc):
+        kc.foreground_window_title = self._orig
         return False
 
 
@@ -500,9 +582,13 @@ class InterfaceTests(unittest.TestCase):
         win.close()
         with open(kc.CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        self.assertIsInstance(data, list)
-        self.assertTrue(data)
-        keys = [t.get("keys") for p in data for t in p.get("tasks", [])]
+        # v1.2.0 新格式：{"version": 2, "theme": ..., "pages": [...]}
+        self.assertIsInstance(data, dict)
+        self.assertEqual(data.get("version"), kc.CONFIG_VERSION)
+        self.assertIn(data.get("theme"), kc.THEME_NAMES)
+        self.assertIsInstance(data.get("pages"), list)
+        self.assertTrue(data["pages"])
+        keys = [t.get("keys") for p in data["pages"] for t in p.get("tasks", [])]
         self.assertIn("ctrl+f9", keys)
 
     def test_poll_and_page_switch(self):
@@ -530,6 +616,335 @@ class InterfaceTests(unittest.TestCase):
                 win._del_page()             # 只剩一页时给出提示
                 self.assertTrue(box.calls)
             self.assertEqual(len(win.pages), 1)
+        finally:
+            win.close()
+
+
+# ══════════════════════════════════════════════════════════
+#  6. 窗口标题匹配（纯函数）
+# ══════════════════════════════════════════════════════════
+class WindowMatchTests(unittest.TestCase):
+    TITLE = "无标题 - 记事本"
+
+    def test_empty_pattern_matches_anything(self):
+        for mode in kc.WINDOW_MODES:
+            self.assertTrue(kc.match_window("", self.TITLE, mode))
+            self.assertTrue(kc.match_window("   ", self.TITLE, mode))
+            self.assertTrue(kc.match_window(None, "", mode))
+
+    def test_contains(self):
+        self.assertTrue(kc.match_window("记事本", self.TITLE, "contains"))
+        self.assertFalse(kc.match_window("浏览器", self.TITLE, "contains"))
+        self.assertTrue(kc.match_window("标题", self.TITLE, "contains"))
+
+    def test_exact(self):
+        self.assertTrue(kc.match_window(self.TITLE, self.TITLE, "exact"))
+        self.assertFalse(kc.match_window("记事本", self.TITLE, "exact"))
+        self.assertFalse(kc.match_window(self.TITLE + "x", self.TITLE, "exact"))
+
+    def test_regex(self):
+        self.assertTrue(kc.match_window(r"^无标题.*记事本$", self.TITLE, "regex"))
+        self.assertTrue(kc.match_window(r"记事本|计算器", self.TITLE, "regex"))
+        self.assertFalse(kc.match_window(r"^\d+$", self.TITLE, "regex"))
+
+    def test_invalid_regex_returns_false_without_raising(self):
+        self.assertFalse(kc.match_window("([", self.TITLE, "regex"))
+        self.assertFalse(kc.match_window("a{2,1}", self.TITLE, "regex"))
+
+    def test_case_insensitive(self):
+        self.assertTrue(kc.match_window("notepad", "Untitled - Notepad", "contains"))
+        self.assertTrue(kc.match_window("NOTEPAD", "Untitled - Notepad", "contains"))
+        self.assertTrue(kc.match_window("notepad", "Notepad", "exact"))
+        self.assertTrue(kc.match_window("notepad", "Untitled - NotePad", "regex"))
+
+    def test_unknown_mode_falls_back_to_contains(self):
+        self.assertTrue(kc.match_window("记事本", self.TITLE, "不存在的模式"))
+        self.assertTrue(kc.match_window("记事本", self.TITLE, ""))
+
+    def test_foreground_helpers_never_raise(self):
+        self.assertIsInstance(kc.foreground_window_title(), str)
+        self.assertIsInstance(kc.foreground_process_name(), str)
+
+
+# ══════════════════════════════════════════════════════════
+#  7. 主题
+# ══════════════════════════════════════════════════════════
+class ThemeTests(unittest.TestCase):
+    def test_themes_differ_and_contain_key_colors(self):
+        light = kc.make_qss("light")
+        dark = kc.make_qss("dark")
+        self.assertNotEqual(light, dark)
+        self.assertIn("#ffffff", light)      # canvas
+        self.assertIn("#0969da", light)      # accent
+        self.assertIn("#d0d7de", light)      # border
+        self.assertIn("#1f883d", light)      # success_emphasis
+        self.assertIn("#0d1117", dark)       # canvas
+        self.assertIn("#2f81f7", dark)       # accent
+        self.assertIn("#30363d", dark)       # border
+        self.assertIn("#238636", dark)       # success_emphasis
+
+    def test_theme_colors_are_exclusive(self):
+        light = kc.make_qss("light")
+        dark = kc.make_qss("dark")
+        self.assertNotIn("#0d1117", light)
+        self.assertNotIn("#2f81f7", light)
+        self.assertNotIn("#0969da", dark)
+        self.assertNotIn("#d0d7de", dark)
+
+    def test_no_legacy_colors(self):
+        for name in kc.THEME_NAMES:
+            qss = kc.make_qss(name)
+            self.assertNotIn("#89b4fa", qss, name)   # 旧紫色系主色
+            self.assertNotIn("#1e1e2e", qss, name)   # 旧深色背景
+
+    def test_invalid_theme_falls_back(self):
+        self.assertEqual(kc.make_qss("不存在的主题"), kc.make_qss())
+        self.assertEqual(kc.make_qss(None), kc.make_qss())
+        self.assertIn(kc.make_qss("不存在的主题"), [kc.make_qss("light"), kc.make_qss("dark")])
+
+    def test_qss_has_no_unsubstituted_tokens(self):
+        for name in kc.THEME_NAMES:
+            qss = kc.make_qss(name)
+            self.assertNotIn("$", qss, name)
+            # 主题靠动态属性选择器实现，界面控件不写死颜色
+            self.assertIn('QLabel[role="muted"]', qss)
+            self.assertIn('QFrame#TaskRow[state="running"]', qss)
+            self.assertIn('QLabel[role="status"]', qss)
+
+    def test_theme_toggle_persists_in_config(self):
+        before = kc.current_theme()
+        with _TempConfig() as path:
+            win = kc.MainWindow()
+            try:
+                win.set_theme("light")
+                self.assertEqual(kc.current_theme(), "light")
+                win._save()
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.assertEqual(data.get("theme"), "light")
+                win.set_theme("dark")
+                win._save()
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.assertEqual(data.get("theme"), "dark")
+            finally:
+                win.close()
+        kc.set_current_theme(before)
+
+    def test_theme_button_text_is_chinese(self):
+        with _TempConfig():
+            win = kc.MainWindow()
+            try:
+                win.set_theme("dark")
+                self.assertEqual(win.btn_theme.text(), "切换到浅色")
+                win.set_theme("light")
+                self.assertEqual(win.btn_theme.text(), "切换到深色")
+            finally:
+                win.close()
+
+    def test_symbolic_theme_never_depends_on_system(self):
+        self.assertIn(kc.system_theme(), kc.THEME_NAMES)
+        self.assertEqual(kc.set_current_theme("bogus"), kc.current_theme())
+
+
+# ══════════════════════════════════════════════════════════
+#  8. 配置文件位置
+# ══════════════════════════════════════════════════════════
+class ConfigPathTests(unittest.TestCase):
+    def test_env_var_wins(self):
+        with _AppDirStub("clicker_config.json") as app_dir:
+            # 程序目录里同时存在 clicker_config.json，环境变量依然优先
+            target = os.path.join(tempfile.gettempdir(), "kc_env_config.json")
+            with _EnvPatch(KEYCLICKER_CONFIG=target):
+                self.assertEqual(kc.resolve_config_path(app_dir), target)
+
+    def test_empty_env_var_is_ignored(self):
+        with _AppDirStub("clicker_config.json") as app_dir:
+            portable = os.path.join(app_dir, "clicker_config.json")
+            with _EnvPatch(KEYCLICKER_CONFIG="   "):
+                self.assertEqual(kc.resolve_config_path(app_dir), portable)
+
+    def test_existing_portable_config_wins_over_appdata(self):
+        with _AppDirStub("clicker_config.json") as app_dir:
+            portable = os.path.join(app_dir, "clicker_config.json")
+            with _EnvPatch(KEYCLICKER_CONFIG=None, APPDATA=_fake_appdata()):
+                self.assertEqual(kc.resolve_config_path(app_dir), portable)
+
+    def test_portable_flag(self):
+        with _AppDirStub("portable.flag") as app_dir:
+            with _EnvPatch(KEYCLICKER_CONFIG=None, APPDATA=_fake_appdata()):
+                self.assertEqual(kc.resolve_config_path(app_dir),
+                                 os.path.join(app_dir, "clicker_config.json"))
+
+    def test_default_appdata_path(self):
+        with _AppDirStub() as app_dir:          # 空目录：两个便携条件都不成立
+            appdata = _fake_appdata()
+            with _EnvPatch(KEYCLICKER_CONFIG=None, APPDATA=appdata):
+                path = kc.resolve_config_path(app_dir)
+                self.assertEqual(path, os.path.join(appdata, "KeyClicker", "config.json"))
+                self.assertTrue(path.startswith(appdata))   # 绝不落入真实用户目录
+
+    def test_ensure_config_dir_creates_directory(self):
+        target = os.path.join(tempfile.gettempdir(), "kc_ensure_dir", "config.json")
+        folder = os.path.dirname(target)
+        shutil.rmtree(folder, ignore_errors=True)
+        try:
+            self.assertFalse(os.path.isdir(folder))
+            kc.ensure_config_dir(target)
+            self.assertTrue(os.path.isdir(folder))
+            kc.ensure_config_dir(target)     # 重复调用不报错
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_module_config_path_is_usable(self):
+        self.assertIsInstance(kc.CONFIG_PATH, str)
+        self.assertTrue(kc.CONFIG_PATH)
+
+
+# ══════════════════════════════════════════════════════════
+#  9. 窗口锁定
+# ══════════════════════════════════════════════════════════
+class WindowLockTaskTests(unittest.TestCase):
+    def test_click_task_blocked_when_window_mismatch(self):
+        t = kc.ClickTask(FAKE_KEY, 20, window_match="记事本")
+        with _StubForeground("Visual Studio Code"):
+            t.start()
+            time.sleep(0.15)
+            self.assertTrue(t.running)
+            self.assertTrue(t.window_blocked)
+            self.assertEqual(t.click_count, 0)     # 一个键都不发、不计数
+            t.stop()
+        self.assertFalse(t.window_blocked)
+
+    def test_click_task_sends_when_window_matched(self):
+        t = kc.ClickTask(FAKE_KEY, 20, window_match="记事本")
+        with _StubForeground("无标题 - 记事本"):
+            t.start()
+            time.sleep(0.15)
+            self.assertGreaterEqual(t.click_count, 2)
+            self.assertFalse(t.window_blocked)
+            t.stop()
+
+    def test_click_task_without_window_match_is_never_blocked(self):
+        t = kc.ClickTask(FAKE_KEY, 20)
+        with _StubForeground("任意窗口"):
+            t.start()
+            time.sleep(0.1)
+            self.assertFalse(t.window_blocked)
+            self.assertGreaterEqual(t.click_count, 1)
+            t.stop()
+
+    def test_timer_task_blocked_when_window_mismatch(self):
+        t = kc.TimerTask([FAKE_KEY], 0, 1, kc.MIN_INTERVAL_MS, window_match="记事本")
+        with _StubForeground("计算器"):
+            t.start()
+            time.sleep(1.4)
+            self.assertEqual(t.fire_count, 0)      # 到点不匹配 → 不触发、不计数
+            self.assertTrue(t.window_blocked)
+            t.stop()
+
+    def test_timer_task_fires_once_window_matched(self):
+        t = kc.TimerTask([FAKE_KEY], 0, 1, kc.MIN_INTERVAL_MS, window_match="记事本")
+        with _StubForeground("无标题 - 记事本"):
+            t.start()
+            deadline = time.time() + 3.0
+            while t.fire_count < 1 and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertGreaterEqual(t.fire_count, 1)
+            self.assertFalse(t.window_blocked)
+            t.stop()
+
+    def test_window_fields_roundtrip(self):
+        click = kc.ClickTask("a", 120, window_match="记事本", window_mode="exact")
+        d = click.to_dict()
+        self.assertEqual(d["window_match"], "记事本")
+        self.assertEqual(d["window_mode"], "exact")
+        back = kc.ClickTask.from_dict(json.loads(json.dumps(d, ensure_ascii=False)))
+        self.assertEqual(back.window_match, "记事本")
+        self.assertEqual(back.window_mode, "exact")
+        self.assertEqual(back.keys, "a")
+        self.assertEqual(back.interval_ms, 120)
+
+        timer = kc.TimerTask(["a", "b"], 0, 5, 100,
+                             window_match="浏览器", window_mode="regex")
+        d2 = timer.to_dict()
+        self.assertEqual(d2["window_match"], "浏览器")
+        self.assertEqual(d2["window_mode"], "regex")
+        back2 = kc.TimerTask.from_dict(d2)
+        self.assertEqual(back2.window_match, "浏览器")
+        self.assertEqual(back2.window_mode, "regex")
+        self.assertEqual(back2.seq, ["a", "b"])
+
+    def test_legacy_task_dict_without_window_fields(self):
+        legacy = {"type": "click", "keys": "win+x", "interval": 50}
+        t = kc.ClickTask.from_dict(legacy)
+        self.assertEqual(t.window_match, "")
+        self.assertEqual(t.window_mode, "contains")
+        self.assertFalse(t.window_blocked)
+
+    def test_invalid_window_mode_normalized(self):
+        self.assertEqual(kc.ClickTask("a", 100, window_mode="bogus").window_mode,
+                         "contains")
+        self.assertEqual(kc.TimerTask(["a"], 0, 3, window_mode=None).window_mode,
+                         "contains")
+
+    def test_page_roundtrip_keeps_window_fields(self):
+        page = kc.Page("配置", [kc.ClickTask("a", 100, window_match="记事本")])
+        back = kc.Page.from_dict(json.loads(json.dumps(page.to_dict(),
+                                                       ensure_ascii=False)))
+        self.assertEqual(back.tasks[0].window_match, "记事本")
+
+
+# ══════════════════════════════════════════════════════════
+#  10. 配置页界面上的窗口匹配
+# ══════════════════════════════════════════════════════════
+class WindowPanelTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = _TempConfig()
+        self.cfg.__enter__()
+
+    def tearDown(self):
+        self.cfg.__exit__(None, None, None)
+
+    def test_add_task_carries_window_settings(self):
+        win = kc.MainWindow()
+        try:
+            panel = win.panels[0]
+            panel.window_edit.setText("记事本")
+            panel.window_mode_combo.setCurrentIndex(kc.WINDOW_MODES.index("exact"))
+            panel._add_task()
+            self.assertEqual(len(panel.page.tasks), 1)
+            task = panel.page.tasks[0]
+            self.assertEqual(task.window_match, "记事本")
+            self.assertEqual(task.window_mode, "exact")
+        finally:
+            win.close()
+
+    def test_invalid_regex_pattern_is_rejected(self):
+        win = kc.MainWindow()
+        try:
+            panel = win.panels[0]
+            panel.window_edit.setText("([")
+            panel.window_mode_combo.setCurrentIndex(kc.WINDOW_MODES.index("regex"))
+            with _NoDialog() as box:
+                panel._add_task()
+                self.assertTrue(box.calls)
+            self.assertEqual(len(panel.page.tasks), 0)
+        finally:
+            win.close()
+
+    def test_row_shows_window_state(self):
+        win = kc.MainWindow()
+        try:
+            panel = win.panels[0]
+            panel.window_edit.setText("记事本")
+            panel._add_task()
+            row = panel.rows[0]
+            row.refresh()
+            self.assertFalse(row.window_lb.isHidden())
+            self.assertIn("记事本", row.window_lb.text())
+            self.assertEqual(row.property("state"), "stopped")
+            self.assertFalse(row.task.window_blocked)
         finally:
             win.close()
 
