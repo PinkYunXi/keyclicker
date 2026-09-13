@@ -778,19 +778,25 @@ class ConfigPathTests(unittest.TestCase):
             with _EnvPatch(KEYCLICKER_CONFIG=None, APPDATA=_fake_appdata()):
                 self.assertEqual(kc.resolve_config_path(app_dir), portable)
 
-    def test_portable_flag(self):
-        with _AppDirStub("portable.flag") as app_dir:
+    def test_writable_app_dir_defaults_to_portable(self):
+        # v1.2.4 起：程序目录可写就默认把配置放在程序目录（便携优先）
+        with _AppDirStub() as app_dir:          # 空目录，但可写
             with _EnvPatch(KEYCLICKER_CONFIG=None, APPDATA=_fake_appdata()):
                 self.assertEqual(kc.resolve_config_path(app_dir),
                                  os.path.join(app_dir, "clicker_config.json"))
 
-    def test_default_appdata_path(self):
-        with _AppDirStub() as app_dir:          # 空目录：两个便携条件都不成立
+    def test_readonly_app_dir_falls_back_to_appdata(self):
+        with _AppDirStub() as app_dir:
             appdata = _fake_appdata()
-            with _EnvPatch(KEYCLICKER_CONFIG=None, APPDATA=appdata):
-                path = kc.resolve_config_path(app_dir)
-                self.assertEqual(path, os.path.join(appdata, "KeyClicker", "config.json"))
-                self.assertTrue(path.startswith(appdata))   # 绝不落入真实用户目录
+            real = kc._dir_writable
+            kc._dir_writable = lambda d: False      # 模拟程序目录不可写
+            try:
+                with _EnvPatch(KEYCLICKER_CONFIG=None, APPDATA=appdata):
+                    path = kc.resolve_config_path(app_dir)
+            finally:
+                kc._dir_writable = real
+            self.assertEqual(path, os.path.join(appdata, "KeyClicker", "config.json"))
+            self.assertTrue(path.startswith(appdata))   # 绝不落入真实用户目录
 
     def test_ensure_config_dir_creates_directory(self):
         target = os.path.join(tempfile.gettempdir(), "kc_ensure_dir", "config.json")
@@ -1449,6 +1455,188 @@ class PopupCard23Tests(unittest.TestCase):
             arrowish = [c for c in top_band if c not in (card, 0x000000)]
             self.assertGreater(len(arrowish), 4, f"{name} 主题滚动箭头看不见了")
             combo.close()
+
+
+# ══════════════════════════════════════════════════════════
+#  17. v1.2.4 后台投递（绑定窗口）与三种生效方式
+# ══════════════════════════════════════════════════════════
+class BackgroundSendTests(unittest.TestCase):
+    """「绑定窗口」生效方式：全程打桩，既不真发窗口消息也不真注入按键。
+
+    用户的核心诉求是**不抢前台**也要能把按键送到目标窗口，所以这里除了
+    验证投递本身，还专门盯着"绝不能走全局注入"（全局注入会打进前台窗口）。
+    """
+
+    def setUp(self):
+        self.calls: list = []
+        self._orig = (kc._post_message, kc.send_keys, kc.is_window_valid,
+                      kc.find_window, kc.foreground_window_pid)
+        kc._post_message = self._fake_post
+        kc.send_keys = self._fake_inject
+        kc.is_window_valid = lambda hwnd: bool(hwnd)
+        kc.find_window = lambda *a, **kw: 0
+        kc.foreground_window_pid = lambda: 0
+
+    def tearDown(self):
+        (kc._post_message, kc.send_keys, kc.is_window_valid,
+         kc.find_window, kc.foreground_window_pid) = self._orig
+
+    def _fake_post(self, hwnd, msg, vk, lparam):
+        self.calls.append(("post", int(hwnd), int(msg), int(vk), int(lparam)))
+        return True
+
+    def _fake_inject(self, keys, hold_ms=20):
+        self.calls.append(("inject", tuple(keys)))
+        return True
+
+    def _posts(self):
+        return [c for c in self.calls if c[0] == "post"]
+
+    def _injects(self):
+        return [c for c in self.calls if c[0] == "inject"]
+
+    # ── 常量表 ──
+    def test_send_modes_have_labels_and_tips(self):
+        self.assertEqual(kc.SEND_MODES, ("foreground", "process", "window"))
+        for m in kc.SEND_MODES:
+            self.assertIn(m, kc.SEND_MODE_LABELS)
+            self.assertIn(m, kc.SEND_MODE_TIPS)
+            self.assertTrue(kc.SEND_MODE_TIPS[m].strip())
+
+    def test_no_mode_steals_foreground(self):
+        """用户明确要求不抢前台：源码里不许出现切前台的调用。"""
+        with open(os.path.join(ROOT, "keyclicker.py"), encoding="utf-8") as f:
+            src = f.read()
+        for bad in ("SetForegroundWindow", "SetActiveWindow", "BringWindowToTop",
+                    "AttachThreadInput", "ShowWindow", "keybd_event"):
+            self.assertNotIn(bad, src, f"不应调用 {bad}：那会抢走前台窗口")
+
+    # ── post_keys 本身 ──
+    def test_post_keys_combo_order(self):
+        """组合键：先按修饰键 → 再按主键 → 逆序松开。"""
+        kc.post_keys(777, ["ctrl", "a"], hold_ms=8)
+        posts = self._posts()
+        self.assertEqual([c[2] for c in posts],
+                         [kc.WM_KEYDOWN, kc.WM_KEYDOWN,
+                          kc.WM_KEYUP, kc.WM_KEYUP])
+        vks = [c[3] for c in posts]
+        self.assertEqual(vks[0], vks[3])      # ctrl 先按下、最后松开
+        self.assertEqual(vks[1], vks[2])      # a 后按下、先松开
+        self.assertIn(vks[0], (0x11, 0xA2, 0xA3))   # VK_CONTROL / 左右 Ctrl
+        self.assertEqual(vks[1], 0x41)              # VK_A
+        self.assertNotEqual(vks[0], vks[1])
+
+    def test_post_keys_alt_uses_syskey(self):
+        """含 Alt 的组合键要走 WM_SYSKEYDOWN/UP，否则很多程序收不到。"""
+        kc.post_keys(777, ["alt", "f4"], hold_ms=8)
+        self.assertEqual({c[2] for c in self._posts()},
+                         {kc.WM_SYSKEYDOWN, kc.WM_SYSKEYUP})
+
+    def test_post_keys_lparam_marks_keyup(self):
+        kc.post_keys(777, ["a"], hold_ms=8)
+        down, up = self._posts()
+        self.assertFalse(down[4] & (1 << 31))
+        self.assertTrue(up[4] & (1 << 31))
+        self.assertTrue(up[4] & (1 << 30))
+        self.assertEqual(down[4] & 0xFF, 1)   # 重复次数 = 1
+
+    def test_post_keys_rejects_bad_input(self):
+        self.assertFalse(kc.post_keys(0, ["a"]))          # 没有窗口
+        self.assertFalse(kc.post_keys(777, []))           # 没有按键
+        self.assertFalse(kc.post_keys(777, [FAKE_KEY]))   # 键名无法识别
+        self.assertEqual(self.calls, [])
+
+    def test_post_keys_refuses_invalid_window(self):
+        kc.is_window_valid = lambda hwnd: False
+        self.assertFalse(kc.post_keys(777, ["a"]))
+        self.assertEqual(self.calls, [])
+
+    # ── 三种生效方式的分流 ──
+    def test_window_mode_posts_and_never_injects(self):
+        """绑定窗口：走窗口消息投递，绝不能退化成全局注入。"""
+        t = kc.ClickTask("a", 100, send_mode="window")
+        t.bind_target(hwnd=4242, pid=77, exe="game.exe")
+        self.assertTrue(t.is_bound)
+        self.assertTrue(t._send(["a"]))
+        self.assertTrue(self._posts())
+        self.assertFalse(self._injects(), "绑定窗口模式不该走全局注入")
+        self.assertTrue(all(c[1] == 4242 for c in self._posts()))
+        self.assertEqual({c[2] for c in self._posts()},
+                         {kc.WM_KEYDOWN, kc.WM_KEYUP})
+
+    def test_window_mode_without_target_sends_nothing(self):
+        t = kc.ClickTask("a", 100, send_mode="window")
+        self.assertFalse(t.is_bound)
+        self.assertFalse(t._send(["a"]))
+        self.assertEqual(self.calls, [])
+
+    def test_window_mode_ignores_foreground_title(self):
+        """目标窗口在后台、前台是毫不相干的程序，照样允许发送。"""
+        t = kc.ClickTask("a", 100, send_mode="window")
+        t.bind_target(hwnd=555, pid=9, exe="x.exe")
+        with _StubForeground("完全无关的窗口"):
+            self.assertTrue(t._window_allows())
+
+    def test_foreground_and_process_modes_use_global_injection(self):
+        for mode in ("foreground", "process"):
+            self.calls.clear()
+            t = kc.ClickTask("a", 100, send_mode=mode)
+            self.assertTrue(t._send(["a"]))
+            self.assertEqual(len(self._injects()), 1, mode)
+            self.assertFalse(self._posts(), mode)
+
+    def test_invalid_send_mode_falls_back_to_foreground(self):
+        self.assertEqual(kc.ClickTask("a", 100, send_mode="bogus").send_mode,
+                         "foreground")
+        self.assertEqual(kc.TimerTask(["a"], 0, 3, send_mode=None).send_mode,
+                         "foreground")
+
+    # ── 目标解析 / 进程绑定 ──
+    def test_bind_target_resets_cached_handle(self):
+        t = kc.ClickTask("a", 100, send_mode="window")
+        t.bind_target(hwnd=111, pid=1, exe="a.exe")
+        self.assertEqual(t._resolve_target(), 111)
+        t.bind_target(hwnd=222, pid=2, exe="b.exe")
+        self.assertEqual(t._cached_hwnd, 0)          # 换绑必须清缓存
+        self.assertEqual(t._resolve_target(), 222)
+
+    def test_resolve_target_refinds_by_process_after_handle_dies(self):
+        """目标程序重开后句柄失效 → 按「同进程 + 标题」重新找到新窗口。"""
+        seen = {}
+
+        def fake_find(pattern, mode, pid=0, exe="", windows=None):
+            seen.update(pattern=pattern, mode=mode, pid=pid, exe=exe)
+            return 999
+
+        t = kc.ClickTask("a", 100, send_mode="window", window_match="游戏",
+                         window_mode="contains")
+        t.bind_target(hwnd=111, pid=1, exe="a.exe")
+        kc.find_window = fake_find
+        kc.is_window_valid = lambda hwnd: hwnd != 111        # 旧句柄已失效
+        self.assertEqual(t._resolve_target(), 999)
+        self.assertEqual(seen["pid"], 1)             # 认准绑定的进程
+        self.assertEqual(seen["exe"], "a.exe")
+        self.assertEqual(seen["pattern"], "游戏")
+
+    # ── 存盘往返 ──
+    def test_send_mode_and_target_roundtrip(self):
+        t = kc.ClickTask("a", 100, send_mode="window")
+        t.bind_target(hwnd=1, pid=2, exe="g.exe")
+        d = t.to_dict()
+        self.assertEqual(d["send_mode"], "window")
+        self.assertEqual((d["target_hwnd"], d["target_pid"], d["target_exe"]),
+                         (1, 2, "g.exe"))
+        back = kc.ClickTask.from_dict(json.loads(json.dumps(d,
+                                                            ensure_ascii=False)))
+        self.assertEqual(back.send_mode, "window")
+        self.assertEqual((back.target_hwnd, back.target_pid, back.target_exe),
+                         (1, 2, "g.exe"))
+
+    def test_legacy_page_without_send_mode(self):
+        legacy = {"type": "click", "keys": "a", "interval": 50}
+        t = kc.ClickTask.from_dict(legacy)
+        self.assertEqual(t.send_mode, "foreground")
+        self.assertFalse(t.is_bound)
 
 
 if __name__ == "__main__":
